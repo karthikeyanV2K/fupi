@@ -1,0 +1,31 @@
+# Rust
+target/
+**/*.rs.bk
+*.pdb
+
+# Go / Executables
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# Local State & Flash Persistence
+*.tmp
+*.bak
+*vault_flash*.json
+*kiosk*_state.json
+test_*.json
+*.pem
+
+# OS generated files
+.DS_Store
+Thumbs.db
