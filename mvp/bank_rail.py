@@ -252,14 +252,36 @@ def main():
     ap.add_argument("--mode", choices=["webhook", "csv", "lightning", "selftest"],
                     default="selftest")
     ap.add_argument("--port", type=int, default=8787)
-    ap.add_argument("--csv", help="path to real bank statement CSV")
+    ap.add_argument("--csv", help="path to real bank statement CSV (SBI/HDFC/ICICI)")
     ap.add_argument("--mint", help="cdk-mintd base URL, e.g. http://127.0.0.1:3338")
+    ap.add_argument("--atm", help="Go HTTPS ATM URL to credit (e.g. https://127.0.0.1:8890)")
     ap.add_argument("--amount", type=int, default=5000,
                     help="minor units for lightning quote (sats)")
     args = ap.parse_args()
 
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from kiosk import Kiosk
+
+    def credit_atm(amt):
+        if not args.atm:
+            return
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        url = args.atm.rstrip("/") + "/v1/credit"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps({"amount": float(amt)}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        try:
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as r:
+                res = json.loads(r.read().decode())
+                print(f"  [bank -> atm] Go HTTPS ATM reserve successfully credited! New reserve: {res.get('reserve'):.2f}")
+        except Exception as e:
+            print(f"  [bank -> atm] Failed to credit Go ATM at {url}: {e}")
 
     if args.mode == "selftest":
         print("=== bank_rail selftest (no real money moves) ===")
@@ -288,21 +310,32 @@ def main():
         sys.exit(0 if ok else 1)
 
     if args.mode == "webhook":
-        k = Kiosk.load() if os.path.exists(Kiosk.STATE_FILE) else Kiosk()
-        k.__class__.STATE_FILE = Kiosk.STATE_FILE
-        kiosk = k
-        demo_webhook_bank(kiosk, port=args.port)
+        if args.atm:
+            wb = WebhookBank(port=args.port)
+            wb.bind(credit_atm)
+            print(f"\n=== REAL BANK MODE: webhook server on :{args.port} -> Go ATM {args.atm} ===")
+            wb.serve_forever()
+        else:
+            k = Kiosk.load() if os.path.exists(Kiosk.STATE_FILE) else Kiosk()
+            k.__class__.STATE_FILE = Kiosk.STATE_FILE
+            kiosk = k
+            demo_webhook_bank(kiosk, port=args.port)
 
     if args.mode == "csv":
         if not args.csv:
-            print("usage: python bank_rail.py --mode csv --csv statement.csv")
+            print("usage: python bank_rail.py --mode csv --csv statement.csv [--atm https://127.0.0.1:8890]")
             sys.exit(2)
-        k = Kiosk.load() if os.path.exists(Kiosk.STATE_FILE) else Kiosk()
         sb = StatementBank(args.csv)
-        sb.bind(k.credit_reserve)
-        total = sb.import_statement()
-        k.save()
-        print(f"  kiosk state saved; reserve now {k.reserve} (+{total})")
+        if args.atm:
+            sb.bind(credit_atm)
+            total = sb.import_statement()
+            print(f"  SBI statement imported total: {total:.2f} credited to Go ATM {args.atm}")
+        else:
+            k = Kiosk.load() if os.path.exists(Kiosk.STATE_FILE) else Kiosk()
+            sb.bind(k.credit_reserve)
+            total = sb.import_statement()
+            k.save()
+            print(f"  kiosk state saved; reserve now {k.reserve} (+{total})")
 
     if args.mode == "lightning":
         if not args.mint:
@@ -310,10 +343,14 @@ def main():
             sys.exit(2)
         k = Kiosk.load() if os.path.exists(Kiosk.STATE_FILE) else Kiosk()
         rail = LightningMintRail(args.mint)
-        rail.bind(k.credit_reserve)
+        if args.atm:
+            rail.bind(credit_atm)
+        else:
+            rail.bind(k.credit_reserve)
         amt = rail.wait_for_topup(amount_minor=args.amount)
-        k.save()
-        print(f"  kiosk state saved; reserve now {k.reserve} (+{amt})")
+        if not args.atm:
+            k.save()
+        print(f"  kiosk reserve now (+{amt})")
 
 
 if __name__ == "__main__":
