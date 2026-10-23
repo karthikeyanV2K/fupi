@@ -27,7 +27,7 @@ from ssd1306 import SSD1306_I2C
 # --- Configuration ---
 WIFI_SSID = "YOUR_WIFI_SSID"
 WIFI_PASS = "YOUR_WIFI_PASSWORD"
-KIOSK_URL = "http://192.168.1.50:8890"  # Kiosk server IP / URL
+KIOSK_URL = "http://192.168.1.50:8890"  # Kiosk IP. PLAIN HTTP = cleartext: trusted LAN / bench use only
 FLASH_FILE = "vault_flash.json"
 
 # --- Initialize Hardware ---
@@ -295,14 +295,13 @@ def handle_settle(token_str):
         print("Settle error:", ex)
 
 
-# --- Bank Credit Simulation ---
+# --- Bank credit is an OPERATOR action, not a device action ---
+# The kiosk only accepts HMAC-signed /v1/credit requests carrying a unique bank
+# reference (see bank_rail.py / `fupi-vault bank`). A vault must never hold that
+# secret, so this command is intentionally not implemented on the Pico.
 def handle_bank(amount):
-    if not wlan.isconnected():
-        print("Connect Wi-Fi first")
-        return
-    code, text = http_request("POST", KIOSK_URL + "/v1/credit", {"amount": float(amount)})
-    print("[BANK CREDIT]", code, text)
-    show_oled("BANK RESERVE +", str(amount), "Credited to Kiosk")
+    print("BANK credit is operator-only (HMAC-signed). Use bank_rail.py or `fupi-vault bank`.")
+    show_oled("BANK: OPERATOR", "ONLY", "see bank_rail.py")
 
 
 # --- Main Loop & REPL Commands ---
@@ -317,7 +316,7 @@ def main():
     print("Commands:")
     print("  TOPUP <n>          -> Withdraw <n> blind-signed tokens from Kiosk")
     print("  PAY <n>            -> Spend <n> tokens (emits bearer token, updates OLED)")
-    print("  BANK <amount>      -> Credit Kiosk reserve with bank transfer test")
+    print("  BANK <amount>      -> (operator-only; not available on the device)")
     print("  SETTLE <tokenB64>  -> Settle a spent token at the Kiosk")
     print("  STATUS             -> Show current status on OLED & Serial")
     print("  WIPE               -> Reset vault and clear flash")

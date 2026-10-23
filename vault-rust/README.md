@@ -33,35 +33,45 @@ Binary output: `target/release/fupi-vault.exe` (or `target/release/fupi-vault` o
 
 ## 3. CLI Commands
 
-```powershell
-# 1. Inspect ATM status and TLS certificate fingerprint over HTTPS
-fupi-vault info --atm https://127.0.0.1:8890 --insecure
+TLS is **strict by default**. The kiosk's self-signed certificate is trusted by pinning its SHA-256
+fingerprint (shown in the kiosk log and by `info`/the dashboard); `--insecure` exists for local development only.
 
-# 2. Fund ATM reserve (bank deposit simulation)
-fupi-vault bank 100 --atm https://127.0.0.1:8890 --insecure
+```bash
+ATM=https://127.0.0.1:8890
+PIN=<sha256 fingerprint printed by the kiosk>
 
-# 3. Withdraw 5 blind-signed bearer proofs from the ATM (blind topup)
-fupi-vault topup 5 --atm https://127.0.0.1:8890 --insecure
+# 1. Pin the ATM's signing keyset once (compare the printed modulus fingerprint out-of-band).
+#    After pinning, a changed keyset is refused unless you run `pin --force`.
+fupi-vault pin --atm $ATM --pin-tls $PIN
+
+# 2. OPERATOR: credit the ATM reserve for a verified bank payment (unique --ref per payment)
+FUPI_CREDIT_SECRET=... fupi-vault bank 100 --ref UTR-123 --atm $ATM --pin-tls $PIN
+
+# 3. Withdraw 5 blind-signed bearer proofs (optionally locked to a payee's ed25519 key)
+fupi-vault topup 5 --atm $ATM --pin-tls $PIN
+fupi-vault topup 2 --lock <payee_pubkey_hex> --atm $ATM --pin-tls $PIN
 
 # 4. Check active bearer balance
 fupi-vault balance
 
-# 5. Spend 2 tokens (emits bearer payment string, deducts from flash)
-fupi-vault pay 2 --p2pk merchant-bob
+# 5. Spend 2 proofs (unlocked ones; or --p2pk <pubkey> to spend proofs locked to that key).
+#    The token is also kept in the outbox until you `ack` it, so a lost screen never loses money.
+fupi-vault pay 2
+fupi-vault outbox
+fupi-vault ack 1
 
-# 6. Recipient verifies token OFFLINE (ZERO network required, checks trusted keyset)
+# 6. Receiver verifies OFFLINE against the pinned keyset (zero network). No pinned keyset = refuse.
 fupi-vault verify <token_string>
 
-# 7. Recipient receives token into flash vault OFFLINE (increases balance, zero network)
+# 7. Receiver imports the token into its flash vault OFFLINE
 fupi-vault receive <token_string>
 
-# 8. Settle token at Go HTTPS ATM
-fupi-vault settle <token_string> --claimer merchant-bob --atm https://127.0.0.1:8890 --insecure
+# 8. Payee creates a claim key once, then settles locked proofs with it
+fupi-vault keygen
+fupi-vault settle <token_string> --claim-key <secret_key_hex> --atm $ATM --pin-tls $PIN
 
-# 9. View vault status and journal history
+# 9. Vault status and journal / wipe (duress or tamper)
 fupi-vault status
-
-# 10. Wipe vault memory (duress / tamper event)
 fupi-vault wipe
 ```
 
@@ -71,15 +81,15 @@ fupi-vault wipe
 
 Run:
 ```powershell
-fupi-vault repl --atm https://127.0.0.1:8890
+fupi-vault repl --atm https://127.0.0.1:8890 --pin-tls <fingerprint>
 ```
 
 Matches the Raspberry Pi Pico W console commands:
 ```text
 fupi-vault> TOPUP 5
-fupi-vault> PAY 2 merchant-bob
+fupi-vault> PAY 2 [lock-pubkey-hex]
 fupi-vault> VERIFY <token>
-fupi-vault> SETTLE <token> merchant-bob
+fupi-vault> SETTLE <token> [claim-key-hex]
 fupi-vault> STATUS
 fupi-vault> WIPE
 ```
@@ -89,6 +99,11 @@ fupi-vault> WIPE
 ## 5. Security & Verification Record
 
 - **Chaum Blinding Math:** `m = SHA256(secret) % N`, `m_blind = (m * r^e) % N`, `sig = (s_blind * r^-1) % N`.
-- **Local Verification:** `pow(sig, e, n) == m`. Tested against Go ATM mint keys.
+- **Verification uses the pinned keyset only:** `n` and `e` are never taken from a token. A token that repeats them must match the pinned values; with no pinned keyset nothing verifies (this closes the `e = 1` and own-modulus forgeries).
+- **Keyset pinning:** first use pins; any later change (modulus or id) is refused until `pin --force`.
+- **TLS:** strict by default; `--pin-tls <sha256>` trusts exactly one certificate; `--insecure` is explicit and warns.
 - **Double-Spend Protection:** First-to-settle-wins; replay attempts return HTTP 409 Conflict.
-- **P2PK Lock Enforcement:** Only the specified claimer can settle locked tokens.
+- **P2PK lock enforcement:** the lock is an ed25519 public key inside the blind-signed secret; settlement needs a signature by that key (`--claim-key`). Locks can only be set at issuance (`topup --lock`).
+- **No lost tokens:** `pay` stores the emitted token in the `outbox` in the same atomic save that removes the proofs.
+
+Known limits: flash is plaintext JSON (no encryption / PIN / secure element yet), no seed restore, 1 proof = 1 unit. See `docs/CODE_PLAN.md`.

@@ -33,6 +33,7 @@
 19. [kiosk-go: Self-Contained HTTPS ATM in Go](kiosk-go/README.md) — production-tier mint
 20. [vault-rust: Lightweight RPi Rust Vault](vault-rust/README.md) — memory-safe offline cash
 21. [Architecture Plan & Execution Flow](docs/ARCHITECTURE_PLAN_FLOW.md) — detailed technical specification
+22. [Code Plan: real-world workflow & build phases](docs/CODE_PLAN.md) — what is built, what is next, how money moves
 
 
 ## 1. What is FUPI?

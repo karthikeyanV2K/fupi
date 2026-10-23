@@ -10,20 +10,25 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -50,13 +55,31 @@ type AtmInfo struct {
 	TLSFingerprint string  `json:"tls_fingerprint_sha256,omitempty"`
 }
 
+// Deposit is one inbound bank/rail credit. The ledger is append-only and every
+// deposit carries a unique external reference (bank UTR, webhook order id, ...),
+// so replaying the same payment can never inflate the reserve.
+type Deposit struct {
+	Ref    string  `json:"ref"`
+	Amount float64 `json:"amount"`
+	At     string  `json:"at"`
+}
+
+var (
+	ErrBadRef    = errors.New("ref required (1-128 chars)")
+	ErrBadAmount = errors.New("amount must be > 0 and finite")
+	ErrDupRef    = errors.New("duplicate deposit reference")
+)
+
 type Kiosk struct {
-	mu        sync.Mutex
-	key       *rsa.PrivateKey
-	reserve   float64
-	issued    int
-	spent     map[string]struct{}
-	statePath string
+	mu           sync.Mutex
+	key          *rsa.PrivateKey
+	reserve      float64
+	issued       int
+	spent        map[string]struct{}
+	deposits     []Deposit
+	depositRefs  map[string]struct{}
+	creditSecret []byte
+	statePath    string
 }
 
 func b64(b []byte) string { return base64.RawURLEncoding.EncodeToString(b) }
@@ -93,25 +116,127 @@ func hashToScalar(secret []byte, n *big.Int) *big.Int {
 // ---- kiosk: reserve, keyset, blind-sign, settle ----
 
 func NewKiosk(statePath string) (*Kiosk, error) {
-	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	k := &Kiosk{
+		spent:       map[string]struct{}{},
+		depositRefs: map[string]struct{}{},
+		statePath:   statePath,
+	}
+	loaded, err := k.loadState()
 	if err != nil {
+		// State exists but is unreadable: NEVER mint a fresh key over it, that
+		// would destroy the signing key and the double-spend set.
 		return nil, err
 	}
-	k := &Kiosk{key: key, spent: map[string]struct{}{}, statePath: statePath}
-	loaded := k.loadState()
-	if !loaded && statePath != "" {
-		// Persist the newly generated RSA keypair immediately so keyset is stable across reboots
-		k.saveState()
+	if !loaded {
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			return nil, err
+		}
+		k.key = key
+		if err := k.saveState(); err != nil {
+			return nil, err
+		}
 	}
 	return k, nil
 }
 
-func (k *Kiosk) CreditReserve(amount float64) {
+// SetCreditSecret configures the HMAC secret that authenticates /v1/credit.
+// Empty secret = credit endpoint disabled.
+func (k *Kiosk) SetCreditSecret(s string) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	k.creditSecret = []byte(s)
+}
+
+func (k *Kiosk) CreditEnabled() bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return len(k.creditSecret) > 0
+}
+
+// VerifyCreditAuth checks hex(HMAC-SHA256(secret, rawBody)) in constant time.
+func (k *Kiosk) VerifyCreditAuth(rawBody []byte, sigHex string) bool {
+	k.mu.Lock()
+	secret := k.creditSecret
+	k.mu.Unlock()
+	if len(secret) == 0 {
+		return false
+	}
+	got, err := hex.DecodeString(strings.TrimSpace(sigHex))
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(rawBody)
+	return hmac.Equal(mac.Sum(nil), got)
+}
+
+// Deposit records a verified inbound payment and raises the reserve. ref must
+// be unique; a repeated ref is rejected (ErrDupRef) and changes nothing.
+func (k *Kiosk) Deposit(ref string, amount float64) (float64, error) {
+	if ref == "" || len(ref) > 128 {
+		return 0, ErrBadRef
+	}
+	if !(amount > 0) || math.IsInf(amount, 0) || amount > 1e12 {
+		return 0, ErrBadAmount
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if _, dup := k.depositRefs[ref]; dup {
+		return k.reserve, ErrDupRef
+	}
+	oldReserve := k.reserve
+	k.deposits = append(k.deposits, Deposit{Ref: ref, Amount: amount, At: time.Now().UTC().Format(time.RFC3339)})
+	k.depositRefs[ref] = struct{}{}
 	k.reserve += amount
-	log.Printf("[kiosk] reserve +%.2f (total %.2f)", amount, k.reserve)
-	k.saveState()
+	if err := k.saveState(); err != nil {
+		k.deposits = k.deposits[:len(k.deposits)-1]
+		delete(k.depositRefs, ref)
+		k.reserve = oldReserve
+		return oldReserve, err
+	}
+	log.Printf("[kiosk] deposit ref=%s +%.2f (reserve %.2f)", ref, amount, k.reserve)
+	return k.reserve, nil
+}
+
+// CreditReserve is a local/test convenience that records a deposit with a
+// random reference. It is NOT reachable over HTTP.
+func (k *Kiosk) CreditReserve(amount float64) {
+	var b [8]byte
+	_, _ = rand.Read(b[:])
+	if _, err := k.Deposit("local-"+hex.EncodeToString(b[:]), amount); err != nil {
+		log.Printf("[kiosk] CreditReserve failed: %v", err)
+	}
+}
+
+// Reconcile summarises whether outstanding tokens are covered by the reserve
+// and whether the deposit ledger adds up to it.
+type Reconcile struct {
+	Reserve          float64 `json:"reserve"`
+	IssuedOutstand   int     `json:"issued_outstanding"`
+	DepositsTotal    float64 `json:"deposits_total"`
+	DepositCount     int     `json:"deposit_count"`
+	SettledCount     int     `json:"settled_count"`
+	FullyBacked      bool    `json:"fully_backed"`
+	LedgerConsistent bool    `json:"ledger_consistent"`
+}
+
+func (k *Kiosk) Reconcile() Reconcile {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	var total float64
+	for _, d := range k.deposits {
+		total += d.Amount
+	}
+	return Reconcile{
+		Reserve:          k.reserve,
+		IssuedOutstand:   k.issued,
+		DepositsTotal:    total,
+		DepositCount:     len(k.deposits),
+		SettledCount:     len(k.spent),
+		FullyBacked:      float64(k.issued) <= k.reserve+1e-9,
+		LedgerConsistent: math.Abs(total-k.reserve) < 1e-6,
+	}
 }
 
 func (k *Kiosk) Pubkey() Keyset {
@@ -142,10 +267,16 @@ func (k *Kiosk) Info(tlsEnabled bool, fingerprint string) AtmInfo {
 // BlindSign signs a blinded scalar. The kiosk NEVER sees the token secret.
 // Textbook RSA on the blinded value is exactly Chaum's scheme — PKCS#1
 // padding would defeat the blinding, so "raw" here is CORRECT, not lazy.
+// Every proof is worth exactly 1 unit until denominations land (see docs/CODE_PLAN.md),
+// so amount must be 1: one signature is released per unit counted as issued.
+// The signature is only released after the new state is persisted.
 func (k *Kiosk) BlindSign(blindedB64 string, amount int) (string, error) {
+	if amount != 1 {
+		return "", fmt.Errorf("amount must be 1 (one signature per unit)")
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if k.issued+amount > int(k.reserve) {
+	if float64(k.issued+amount) > k.reserve {
 		return "", fmt.Errorf("insufficient reserve (1:1 rule)")
 	}
 	raw, err := unb64(blindedB64)
@@ -158,7 +289,10 @@ func (k *Kiosk) BlindSign(blindedB64 string, amount int) (string, error) {
 	}
 	sB := new(big.Int).Exp(mB, k.key.D, k.key.N)
 	k.issued += amount
-	k.saveState()
+	if err := k.saveState(); err != nil {
+		k.issued -= amount
+		return "", fmt.Errorf("could not persist issuance: %w", err)
+	}
 	return b64(sB.Bytes()), nil
 }
 
@@ -172,16 +306,33 @@ type Proof struct {
 	Claimer  string `json:"claimer,omitempty"`
 }
 
-func constEq(a, b string) bool {
-	return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1
+// lockOf parses an optional "|lock=<ed25519 pubkey hex>" suffix of a secret.
+// The lock lives INSIDE the blind-signed secret, so it cannot be stripped or
+// rewritten after issuance without invalidating the mint's signature.
+func lockOf(secret string) (pub ed25519.PublicKey, locked bool, err error) {
+	i := strings.Index(secret, "|lock=")
+	if i < 0 {
+		return nil, false, nil
+	}
+	b, derr := hex.DecodeString(secret[i+len("|lock="):])
+	if derr != nil || len(b) != ed25519.PublicKeySize {
+		return nil, true, fmt.Errorf("malformed lock")
+	}
+	return ed25519.PublicKey(b), true, nil
 }
 
+// Settle redeems a proof. If the secret carries a lock, Claimer must be the
+// hex ed25519 signature over the secret bytes by the locked key. The legacy
+// P2PK field is ignored: it was an unauthenticated label and gave no security.
 func (k *Kiosk) Settle(p Proof) (bool, string) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
 	if p.Secret == "" {
 		return false, "REJECTED: empty secret"
 	}
+	if len(p.Secret) > 256 {
+		return false, "REJECTED: secret too long"
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
 	if _, dup := k.spent[p.Secret]; dup {
 		return false, "REJECTED: double-spend (already settled)"
 	}
@@ -195,32 +346,61 @@ func (k *Kiosk) Settle(p Proof) (bool, string) {
 	}
 	m := hashToScalar([]byte(p.Secret), k.key.N)
 	check := new(big.Int).Exp(s, big.NewInt(int64(k.key.PublicKey.E)), k.key.N)
-	if os.Getenv("FUPI_DEBUG") != "" {
-		log.Printf("[debug settle] secret=%q\n  m=  %x\n  chk=%x\n  N=  %x\n  e=%d",
-			p.Secret, m, check, k.key.N, k.key.PublicKey.E)
-	}
 	if check.Cmp(m) != 0 {
 		return false, "REJECTED: bad signature"
 	}
-	if p.P2PK != "" && !constEq(p.P2PK, p.Claimer) {
-		return false, "REJECTED: P2PK lock (not the owner)"
+	lockPub, locked, lerr := lockOf(p.Secret)
+	if lerr != nil {
+		return false, "REJECTED: malformed lock"
+	}
+	if locked {
+		claim, derr := hex.DecodeString(strings.TrimSpace(p.Claimer))
+		if derr != nil || !ed25519.Verify(lockPub, []byte(p.Secret), claim) {
+			return false, "REJECTED: P2PK lock (invalid claim signature)"
+		}
 	}
 	k.spent[p.Secret] = struct{}{}
-	if k.issued > 0 {
+	hadIssued := k.issued > 0
+	if hadIssued {
 		k.issued--
 	}
-	k.saveState()
+	if err := k.saveState(); err != nil {
+		delete(k.spent, p.Secret)
+		if hadIssued {
+			k.issued++
+		}
+		return false, "REJECTED: could not persist settlement"
+	}
 	return true, "settled OK (first-to-settle-wins)"
 }
 
-// ---- persistence (survives restarts; same job as kiosk_state.json) ----
+// ---- persistence (survives restarts) ----
+// Write path: state -> .tmp (fsync) -> copy last GOOD state to .bak -> rename.
+// Load path: main, then .tmp, then .bak. If any state file exists but none is
+// valid we refuse to start, rather than silently generating a new key.
 
 type diskState struct {
-	N       string   `json:"n"`
-	D       string   `json:"d"`
-	Reserve float64  `json:"reserve"`
-	Issued  int      `json:"issued"`
-	Spent   []string `json:"spent"`
+	N        string    `json:"n"`
+	D        string    `json:"d"`
+	Reserve  float64   `json:"reserve"`
+	Issued   int       `json:"issued"`
+	Spent    []string  `json:"spent"`
+	Deposits []Deposit `json:"deposits,omitempty"`
+}
+
+func readState(path string) (*diskState, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var st diskState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return nil, err
+	}
+	if st.N == "" || st.D == "" {
+		return nil, errors.New("missing key material")
+	}
+	return &st, nil
 }
 
 func (k *Kiosk) saveState() error {
@@ -228,10 +408,11 @@ func (k *Kiosk) saveState() error {
 		return nil
 	}
 	st := diskState{
-		N:       b64(k.key.N.Bytes()),
-		D:       b64(k.key.D.Bytes()),
-		Reserve: k.reserve,
-		Issued:  k.issued,
+		N:        b64(k.key.N.Bytes()),
+		D:        b64(k.key.D.Bytes()),
+		Reserve:  k.reserve,
+		Issued:   k.issued,
+		Deposits: k.deposits,
 	}
 	for s := range k.spent {
 		st.Spent = append(st.Spent, s)
@@ -256,44 +437,88 @@ func (k *Kiosk) saveState() error {
 	if err := f.Close(); err != nil {
 		return err
 	}
+	// Keep the last known-good state as .bak (never overwrite it with a corrupt file).
+	if _, err := readState(k.statePath); err == nil {
+		if prev, rerr := os.ReadFile(k.statePath); rerr == nil {
+			_ = os.WriteFile(k.statePath+".bak", prev, 0600)
+		}
+	}
 	return os.Rename(tmpPath, k.statePath)
 }
 
-func (k *Kiosk) loadState() bool {
-	if k.statePath == "" {
-		return false
-	}
-	data, err := os.ReadFile(k.statePath)
-	if err != nil || len(data) == 0 {
-		// Attempt fallback to .tmp if power failure happened during rename
-		tmpData, tmpErr := os.ReadFile(k.statePath + ".tmp")
-		if tmpErr == nil && len(tmpData) > 0 {
-			data = tmpData
-			_ = os.Rename(k.statePath+".tmp", k.statePath)
-		} else {
-			return false
-		}
-	}
-	var st diskState
-	if json.Unmarshal(data, &st) != nil || st.N == "" || st.D == "" {
-		return false
-	}
+func (k *Kiosk) applyState(st *diskState) error {
 	nBytes, errN := unb64(st.N)
 	dBytes, errD := unb64(st.D)
 	if errN != nil || errD != nil {
-		log.Printf("[kiosk] corrupt keys in state: %v / %v", errN, errD)
-		return false
+		return fmt.Errorf("corrupt key encoding")
 	}
 	n := new(big.Int).SetBytes(nBytes)
 	d := new(big.Int).SetBytes(dBytes)
+	if n.Sign() <= 0 || d.Sign() <= 0 {
+		return fmt.Errorf("invalid key material")
+	}
+	// Prove (n, d) is a working RSA pair: (2^d)^e == 2 (mod n).
+	two := big.NewInt(2)
+	if new(big.Int).Exp(new(big.Int).Exp(two, d, n), big.NewInt(65537), n).Cmp(two) != 0 {
+		return fmt.Errorf("key pair self-check failed")
+	}
 	k.key = &rsa.PrivateKey{PublicKey: rsa.PublicKey{N: n, E: 65537}, D: d}
 	k.reserve, k.issued = st.Reserve, st.Issued
+	k.spent = map[string]struct{}{}
 	for _, s := range st.Spent {
 		k.spent[s] = struct{}{}
 	}
-	log.Printf("[kiosk] state loaded: reserve=%.2f issued=%d spent=%d",
-		k.reserve, k.issued, len(k.spent))
-	return true
+	k.deposits = append([]Deposit(nil), st.Deposits...)
+	k.depositRefs = map[string]struct{}{}
+	var sum float64
+	for _, d := range k.deposits {
+		k.depositRefs[d.Ref] = struct{}{}
+		sum += d.Amount
+	}
+	// State written before the ledger existed: book the gap as an opening balance.
+	if gap := k.reserve - sum; gap > 1e-9 {
+		k.deposits = append(k.deposits, Deposit{Ref: "legacy-opening-balance", Amount: gap, At: time.Now().UTC().Format(time.RFC3339)})
+		k.depositRefs["legacy-opening-balance"] = struct{}{}
+	}
+	return nil
+}
+
+func (k *Kiosk) loadState() (bool, error) {
+	if k.statePath == "" {
+		return false, nil
+	}
+	anyExists := false
+	var firstErr error
+	for _, p := range []string{k.statePath, k.statePath + ".tmp", k.statePath + ".bak"} {
+		if _, err := os.Stat(p); err != nil {
+			continue
+		}
+		anyExists = true
+		st, err := readState(p)
+		if err == nil {
+			err = k.applyState(st)
+		}
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("%s: %w", p, err)
+			}
+			log.Printf("[kiosk] state file %s unusable: %v", p, err)
+			continue
+		}
+		if p != k.statePath {
+			log.Printf("[kiosk] RECOVERED state from %s (last operation may be lost)", p)
+			if err := k.saveState(); err != nil {
+				return false, err
+			}
+		}
+		log.Printf("[kiosk] state loaded: reserve=%.2f issued=%d spent=%d deposits=%d",
+			k.reserve, k.issued, len(k.spent), len(k.deposits))
+		return true, nil
+	}
+	if anyExists {
+		return false, fmt.Errorf("state file(s) exist but none are valid; refusing to create a new key: %v", firstErr)
+	}
+	return false, nil
 }
 
 // ---- Self-Contained TLS Certificate Generator ----
@@ -451,74 +676,113 @@ func fileExists(path string) bool {
 	return true
 }
 
+func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, 1<<16)
+	return json.NewDecoder(r.Body).Decode(v) == nil
+}
+
 func SetupMux(k *Kiosk, tlsEnabled bool, fingerprint string) *http.ServeMux {
 	mux := http.NewServeMux()
+
+	getOnly := func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return false
+		}
+		return true
+	}
+	postOnly := func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodPost {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+			return false
+		}
+		return true
+	}
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" && r.URL.Path != "/atm" {
 			http.NotFound(w, r)
 			return
 		}
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		if !getOnly(w, r) {
 			return
 		}
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		info := k.Info(tlsEnabled, fingerprint)
-		dashTmpl.Execute(w, info)
+		dashTmpl.Execute(w, k.Info(tlsEnabled, fingerprint))
 	})
 
 	mux.HandleFunc("/v1/info", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
+		if getOnly(w, r) {
+			writeJSON(w, 200, k.Info(tlsEnabled, fingerprint))
 		}
-		writeJSON(w, 200, k.Info(tlsEnabled, fingerprint))
 	})
 
 	mux.HandleFunc("/v1/keyset", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
-			return
+		if getOnly(w, r) {
+			writeJSON(w, 200, k.Pubkey())
 		}
-		writeJSON(w, 200, k.Pubkey())
 	})
 
+	mux.HandleFunc("/v1/reconcile", func(w http.ResponseWriter, r *http.Request) {
+		if getOnly(w, r) {
+			writeJSON(w, 200, k.Reconcile())
+		}
+	})
+
+	// POST /v1/credit  body {"amount": <major units>, "ref": "<unique bank ref>"}
+	// Header X-Fupi-Signature: hex(HMAC-SHA256(credit secret, raw body)).
 	mux.HandleFunc("/v1/credit", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		if !postOnly(w, r) {
+			return
+		}
+		if !k.CreditEnabled() {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"error": "credit endpoint disabled: set -credit-secret or FUPI_CREDIT_SECRET"})
+			return
+		}
+		raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<16))
+		if err != nil {
+			writeJSON(w, 400, map[string]string{"error": "bad request"})
+			return
+		}
+		if !k.VerifyCreditAuth(raw, r.Header.Get("X-Fupi-Signature")) {
+			writeJSON(w, 401, map[string]string{"error": "bad or missing X-Fupi-Signature"})
 			return
 		}
 		var body struct {
-			Amount float64 `json:"amount"` // major units; the bank rails call this
+			Amount float64 `json:"amount"`
+			Ref    string  `json:"ref"`
 		}
-		if json.NewDecoder(r.Body).Decode(&body) != nil || body.Amount <= 0 {
-			writeJSON(w, 400, map[string]string{"error": "amount<=0"})
+		if json.Unmarshal(raw, &body) != nil {
+			writeJSON(w, 400, map[string]string{"error": "bad request"})
 			return
 		}
-		k.CreditReserve(body.Amount)
-		writeJSON(w, 200, map[string]float64{"reserve": k.reserve})
+		reserve, err := k.Deposit(body.Ref, body.Amount)
+		switch {
+		case errors.Is(err, ErrDupRef):
+			writeJSON(w, 409, map[string]string{"error": err.Error()})
+		case errors.Is(err, ErrBadRef), errors.Is(err, ErrBadAmount):
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+		case err != nil:
+			writeJSON(w, 500, map[string]string{"error": "could not persist deposit"})
+		default:
+			writeJSON(w, 200, map[string]float64{"reserve": reserve})
+		}
 	})
 
 	mux.HandleFunc("/v1/blind-sign", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		if !postOnly(w, r) {
 			return
 		}
 		var body struct {
 			BlindedMessage string `json:"blinded_message"`
 			Amount         int    `json:"amount"`
 		}
-		if json.NewDecoder(r.Body).Decode(&body) != nil || body.Amount <= 0 {
+		if !decodeJSON(w, r, &body) || body.Amount <= 0 {
 			writeJSON(w, 400, map[string]string{"error": "bad request"})
 			return
 		}
 		sig, err := k.BlindSign(body.BlindedMessage, body.Amount)
-		if os.Getenv("FUPI_DEBUG") != "" {
-			if raw, err := unb64(body.BlindedMessage); err == nil {
-				log.Printf("[debug sign] blindedBits=%d", new(big.Int).SetBytes(raw).BitLen())
-			}
-		}
 		if err != nil {
 			writeJSON(w, 402, map[string]string{"error": err.Error()})
 			return
@@ -527,24 +791,42 @@ func SetupMux(k *Kiosk, tlsEnabled bool, fingerprint string) *http.ServeMux {
 	})
 
 	mux.HandleFunc("/v1/settle", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		if !postOnly(w, r) {
 			return
 		}
 		var proof Proof
-		if json.NewDecoder(r.Body).Decode(&proof) != nil {
+		if !decodeJSON(w, r, &proof) {
 			writeJSON(w, 400, map[string]string{"error": "bad proof"})
 			return
 		}
 		ok, msg := k.Settle(proof)
 		code := 200
 		if !ok {
-			code = 409 // conflict: double-spend / bad sig / P2PK violation
+			code = 409 // conflict: double-spend / bad sig / lock violation
 		}
 		writeJSON(w, code, map[string]string{"result": msg})
 	})
 
 	return mux
+}
+
+func newServer(addr string, h http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           h,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 16,
+	}
+}
+
+func certFingerprint(c tls.Certificate) string {
+	if len(c.Certificate) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%X", sha256.Sum256(c.Certificate[0]))
 }
 
 func main() {
@@ -555,59 +837,33 @@ func main() {
 	keyFile := flag.String("key", "", "custom TLS private key PEM path (optional)")
 	saveCert := flag.Bool("save-cert", true, "save auto-generated TLS certificate to kiosk_cert.pem & kiosk_key.pem")
 	forceNewCert := flag.Bool("force-new-cert", false, "force new TLS cert generation even if kiosk_cert.pem exists")
+	creditSecret := flag.String("credit-secret", os.Getenv("FUPI_CREDIT_SECRET"),
+		"HMAC secret authenticating POST /v1/credit (prefer env FUPI_CREDIT_SECRET). Empty = credit endpoint disabled")
 	flag.Parse()
 
 	k, err := NewKiosk(*statePath)
 	if err != nil {
 		log.Fatal(err)
 	}
+	k.SetCreditSecret(*creditSecret)
+	if !k.CreditEnabled() {
+		log.Printf("[kiosk-go] WARNING: no credit secret configured; /v1/credit is DISABLED (reserve cannot grow)")
+	}
 
 	addr := fmt.Sprintf(":%d", *port)
 
 	if !*useTLS {
-		log.Printf("[kiosk-go] FUPI ATM (Go) listening on http://%s (Plain HTTP, TLS disabled)", addr)
-		mux := SetupMux(k, false, "")
-		log.Fatal(http.ListenAndServe(addr, mux))
+		log.Printf("[kiosk-go] FUPI ATM (Go) listening on http://%s (Plain HTTP, TLS disabled; do not expose publicly)", addr)
+		log.Fatal(newServer(addr, SetupMux(k, false, "")).ListenAndServe())
 	}
 
 	var tlsCert tls.Certificate
-	var fingerprint string
-
-	if *certFile != "" && *keyFile != "" {
-		tlsCert, err = tls.LoadX509KeyPair(*certFile, *keyFile)
-		if err != nil {
-			log.Fatalf("failed to load custom TLS cert/key: %v", err)
-		}
-		if len(tlsCert.Certificate) > 0 {
-			fp := sha256.Sum256(tlsCert.Certificate[0])
-			fingerprint = fmt.Sprintf("%X", fp)
-		}
-		log.Printf("[kiosk-go] loaded custom TLS certificate from %s / %s", *certFile, *keyFile)
-	} else if !*forceNewCert && fileExists("kiosk_cert.pem") && fileExists("kiosk_key.pem") {
-		tlsCert, err = tls.LoadX509KeyPair("kiosk_cert.pem", "kiosk_key.pem")
-		if err == nil && len(tlsCert.Certificate) > 0 {
-			fp := sha256.Sum256(tlsCert.Certificate[0])
-			fingerprint = fmt.Sprintf("%X", fp)
-			log.Printf("[kiosk-go] reused existing TLS certificate from kiosk_cert.pem and kiosk_key.pem")
-		} else {
-			hosts := []string{"127.0.0.1", "localhost"}
-			var certPEM, keyPEM []byte
-			tlsCert, certPEM, keyPEM, fingerprint, err = generateSelfSignedCert(hosts)
-			if err != nil {
-				log.Fatalf("failed to generate self-signed TLS cert: %v", err)
-			}
-			if *saveCert {
-				_ = os.WriteFile("kiosk_cert.pem", certPEM, 0644)
-				_ = os.WriteFile("kiosk_key.pem", keyPEM, 0600)
-				log.Printf("[kiosk-go] auto-generated TLS cert saved to kiosk_cert.pem and kiosk_key.pem")
-			}
-		}
-	} else {
-		hosts := []string{"127.0.0.1", "localhost"}
+	generate := func() {
 		var certPEM, keyPEM []byte
-		tlsCert, certPEM, keyPEM, fingerprint, err = generateSelfSignedCert(hosts)
-		if err != nil {
-			log.Fatalf("failed to generate self-signed TLS cert: %v", err)
+		var gerr error
+		tlsCert, certPEM, keyPEM, _, gerr = generateSelfSignedCert([]string{"127.0.0.1", "localhost"})
+		if gerr != nil {
+			log.Fatalf("failed to generate self-signed TLS cert: %v", gerr)
 		}
 		if *saveCert {
 			_ = os.WriteFile("kiosk_cert.pem", certPEM, 0644)
@@ -616,19 +872,32 @@ func main() {
 		}
 	}
 
-	mux := SetupMux(k, true, fingerprint)
+	switch {
+	case *certFile != "" && *keyFile != "":
+		tlsCert, err = tls.LoadX509KeyPair(*certFile, *keyFile)
+		if err != nil {
+			log.Fatalf("failed to load custom TLS cert/key: %v", err)
+		}
+		log.Printf("[kiosk-go] loaded custom TLS certificate from %s / %s", *certFile, *keyFile)
+	case !*forceNewCert && fileExists("kiosk_cert.pem") && fileExists("kiosk_key.pem"):
+		tlsCert, err = tls.LoadX509KeyPair("kiosk_cert.pem", "kiosk_key.pem")
+		if err != nil {
+			generate()
+		} else {
+			log.Printf("[kiosk-go] reused existing TLS certificate from kiosk_cert.pem and kiosk_key.pem")
+		}
+	default:
+		generate()
+	}
+	fingerprint := certFingerprint(tlsCert)
 
-	server := &http.Server{
-		Addr:    addr,
-		Handler: mux,
-		TLSConfig: &tls.Config{
-			Certificates: []tls.Certificate{tlsCert},
-			MinVersion:   tls.VersionTLS12,
-		},
+	server := newServer(addr, SetupMux(k, true, fingerprint))
+	server.TLSConfig = &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		MinVersion:   tls.VersionTLS12,
 	}
 
 	log.Printf("[kiosk-go] FUPI Self-Contained HTTPS ATM listening on https://127.0.0.1%s", addr)
 	log.Printf("[kiosk-go] TLS Fingerprint (SHA-256): %s", fingerprint)
-	log.Printf("[kiosk-go] 1:1 reserve, Chaum RSA-2048 blind signer, zero-middleman cash mint")
 	log.Fatal(server.ListenAndServeTLS("", ""))
 }
