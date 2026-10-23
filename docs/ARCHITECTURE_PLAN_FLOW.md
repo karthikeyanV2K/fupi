@@ -84,7 +84,7 @@
 ### Flow 1: Inbound Bank Deposit (ATM Reserve Funding)
 1. User makes a standard bank transfer (NEFT, IMPS, or LN deposit) into the ATM reserve.
 2. The bank sees **one ordinary ATM withdrawal/deposit transaction**. The bank's job is finished here.
-3. ATM credits reserve: `POST /v1/credit {"amount": 100}` &rarr; reserve becomes 100.00.
+3. The bank rail credits the reserve: `POST /v1/credit {"amount": 100, "ref": "<bank UTR>"}` with header `X-Fupi-Signature = HMAC-SHA256(secret, body)` &rarr; reserve becomes 100.00. A repeated `ref` is rejected (409) and the deposit is appended to the ledger (`GET /v1/reconcile`).
 4. **The 1:1 rule:** The ATM strictly enforces `issued + amount <= reserve`. No unbacked tokens can ever be minted.
 
 ### Flow 2: Keyset Discovery & Authentication
@@ -124,19 +124,19 @@
 ### Flow 4: Bearer Payment Transfer (Handover)
 1. Payer runs `fupi-vault pay 2 [--p2pk <recipient_pubkey>]`.
 2. The vault checks its balance, extracts 2 proofs, and deducts them from flash.
-3. If P2PK is specified, the recipient's public key is attached to the proof:
+3. A P2PK lock is fixed at issuance (`topup --lock <ed25519 pubkey>`): the pubkey is part of the blind-signed secret, so it cannot be stripped or changed later. `pay --p2pk <pubkey>` spends proofs locked to that key:
    ```json
    [
      {
-       "secret": "fupi-a33720f25e4bba933c4b4f9841dd2ea2",
+       "secret": "fupi-a33720f25e4bba933c4b4f9841dd2ea2|lock=<64 hex chars>",
        "sig": "...",
        "n": "...",
        "e": 65537,
-       "keyset_id": "go-mvp-00",
-       "p2pk": "merchant-charlie"
+       "keyset_id": "go-mvp-00"
      }
    ]
    ```
+   The emitted token is also saved to the vault `outbox` in the same atomic write that removes the proofs.
 4. The token is serialized as a URL-safe or standard Base64 string.
 5. The token is handed over to the receiver (via QR code, BLE packet, Nostr message, or local file).
 
@@ -145,8 +145,8 @@
 2. Recipient runs `fupi-vault verify <token>`.
 3. For each proof:
    - Derives $m = \text{SHA256}(\text{secret}) \pmod N$.
-   - Verifies $(s^e \pmod N) == m$.
-   - **Forgery Guard:** Strictly validates that the proof's modulus $N$ and `keyset_id` match the trusted ATM keyset. Tokens signed under an attacker's custom modulus are instantly rejected.
+   - Verifies $(s^e \pmod N) == m$ using **$N$ and $e$ from the pinned keyset only**.
+   - **Forgery Guard:** if the proof repeats `n`, `e` or `keyset_id` they must equal the pinned values; with no pinned keyset verification is refused. Tokens carrying their own key, or `e = 1`, are rejected.
 4. If valid, the recipient accepts the payment with 100% mathematical certainty that the mint signed it. **No internet connection, cellular service, or switch is required.**
 
 ### Flow 6: Peer-to-Peer Offline Cash Receipt & Vault Import
@@ -161,7 +161,7 @@
 2. The ATM verifies:
    - Secret has not been spent before: `spent[secret] == nil`.
    - RSA signature matches: $(s^e \pmod N) == \text{SHA256}(\text{secret}) \pmod N$.
-   - P2PK lock check: If `p2pk` is set, `claimer` must match in constant time (`subtle.ConstantTimeCompare`).
+   - Lock check: if the secret carries `|lock=<pubkey>`, `claimer` must be a valid ed25519 signature over the secret by that key.
 3. ATM records `spent[secret] = struct{}{}`, decrements `issued`, and returns `200 settled OK`.
 
 ### Flow 8: Double-Spend / Replay Protection & Concurrency
@@ -198,11 +198,12 @@
 
 | Test Suite | File | Coverage | Result |
 |---|---|---|---|
+| **Go ATM hardening tests** | `kiosk-go/hardening_test.go` | HMAC-authenticated credit, replayed bank ref, reconcile ledger, locked-proof claims (no key / wrong key / relabel / stripped lock), corrupt-state recovery without key regeneration, legacy opening balance | **PASS** |
 | **Go ATM Unit & Concurrency Tests** | `kiosk-go/settle_test.go` | In-process blinding math, signature verification, settlement, double-spend replay prevention, invalid Base64 input resilience, and 50-goroutine parallel race serialization | **PASS** |
 | **Go ATM TLS Tests** | `kiosk-go/tls_test.go` | Self-signed TLS cert generation, HTTPS listener boot, custom CA client verification, HTTPS endpoints | **PASS** |
-| **Rust Vault Unit Tests** | `vault-rust/src/crypto.rs` | Base64 URL & Standard decoding, scalar hashing, extended Euclidean inverse, blinding, unblinding, mock RSA verify | **PASS** (8/8) |
+| **Rust Vault Unit Tests** | `vault-rust/src/{crypto,client,storage}.rs` | Base64, hashing, modular inverse, blind/unblind/verify, lock + claim signature, TLS pin matching, atomic storage | **PASS** (11/11) |
 | **Rust Flash Resilience Tests** | `vault-rust/src/storage.rs` | Atomic file write, sync_all, rename, persistence reload, wipe, and power-loss recovery from corrupted/truncated primary files via `.bak` | **PASS** (2/2) |
-| **Rust Vault Tests** | `vault-rust/tests/vault_tests.rs` | Vault balance tracking, payment token generation, offline recipient verification, tampered token rejection, peer-to-peer offline receive, and counterfeit modulus rejection | **PASS** (4/4) |
+| **Rust Vault Tests** | `vault-rust/tests/vault_tests.rs` | Lifecycle with real locks, tamper rejection, P2P receive, counterfeit modulus, `e=1` forgery, no-pinned-keyset refusal, keyset-pin change refusal, lock-aware proof selection, outbox crash safety | **PASS** (8/8) |
 | **Python <-> Go TLS Interop** | `kiosk-go/cross_lang_test.py` | Python blinding & unblinding &rarr; Go HTTPS ATM signing & settle over TLS with certificate reuse | **PASS** |
-| **End-to-End System Test** | `kiosk-go/e2e_https_rust_vault_test.py` | Full 13-step workflow: Go HTTPS ATM boot &rarr; Reserve credit &rarr; Rust Vault blind topup &rarr; Spend &rarr; Offline verify &rarr; Settle &rarr; Replay reject &rarr; P2PK theft reject &rarr; Peer-to-peer offline receive &rarr; Counterfeit modulus reject &rarr; 5-thread parallel settle race | **PASS** (13/13) |
+| **End-to-End System Test** | `kiosk-go/e2e_https_rust_vault_test.py` | Pinned-TLS boot, strict/wrong-pin refusal, authenticated + idempotent credit, blind topup, real P2PK (no key / wrong key / relabelled / owner), outbox, P2P receive, forged `e=1`/fake-modulus rejection, 5-way settle race, final reconcile | **PASS** (9 steps) |
 | **MVP Reference Test** | `mvp/test_mvp.py` | 17 reference bank rail and Chaum blinding tests | **PASS** (17/17) |

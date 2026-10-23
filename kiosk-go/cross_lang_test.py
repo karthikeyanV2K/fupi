@@ -4,15 +4,17 @@ Proves the FUPI protocol is language-independent:
   Python blinding -> Go blind-sign (RSA-2048) -> Python unblind/verify
   -> Go settle (200) -> replay (409) -> thief claim (409, defense-in-depth).
 
-Start the Go kiosk first:
-  kiosk-go\kiosk-go.exe -port 8890 -tls=true
+Start the Go kiosk first (the credit secret enables the authenticated /v1/credit):
+  FUPI_CREDIT_SECRET=xyz ./kiosk-go -port 8890 -tls=true
 Then:
-  python kiosk-go\cross_lang_test.py 8890 https
+  FUPI_CREDIT_SECRET=xyz python kiosk-go/cross_lang_test.py 8890 https
 """
 
 import base64
 import hashlib
+import hmac
 import json
+import os
 import math
 import random
 import ssl
@@ -34,10 +36,11 @@ def get(path):
         return json.loads(r.read().decode())
 
 
-def post(path, payload):
-    req = urllib.request.Request(BASE + path, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"},
-                                 method="POST")
+def post(path, payload, headers=None):
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    h = {"Content-Type": "application/json"}
+    h.update(headers or {})
+    req = urllib.request.Request(BASE + path, data=body, headers=h, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=10, context=SSL_CTX) as r:
             return r.status, json.loads(r.read().decode())
@@ -55,32 +58,46 @@ def main():
     e = ks["e"]
     print(f"[1] keyset {ks['keyset_id']} fetched: RSA-{n.bit_length()} bits, e={e}")
 
-    s, r = post("/v1/credit", {"amount": 100})
+    # Credit needs HMAC auth + a unique ref (replay-safe).
+    secret_key = os.environ.get("FUPI_CREDIT_SECRET")
+    assert secret_key, "set FUPI_CREDIT_SECRET to the value the kiosk runs with"
+    body = json.dumps({"amount": 100, "ref": f"xlang-{random.getrandbits(48):x}"},
+                      separators=(",", ":")).encode()
+    s, r = post("/v1/credit", json.loads(body), {"X-Fupi-Signature": "00" * 32})
+    assert s == 401, (s, r)
+    print("[2a] credit with a bad signature refused (401)")
+    ref = json.loads(body)["ref"]
+    sig_hdr = hmac.new(secret_key.encode(), body, hashlib.sha256).hexdigest()
+    s, r = post("/v1/credit", {"amount": 100, "ref": ref}, {"X-Fupi-Signature": sig_hdr})
     assert s == 200, r
-    print(f"[2] reserve credited: {r['reserve']}")
-
-    secret = "cross-lang-token-001"
-    m = int.from_bytes(hashlib.sha256(secret.encode()).digest(), "big") % n
-    if m < 2:
-        m = 2
-    while True:
-        rr = random.randrange(2, n - 1)
-        if math.gcd(rr, n) == 1:
-            break
-    blinded = pow(m * pow(rr, e, n), 1, n)
+    print(f"[2b] reserve credited: {r['reserve']}")
+    s, r = post("/v1/credit", {"amount": 100, "ref": ref}, {"X-Fupi-Signature": sig_hdr})
+    assert s == 409, (s, r)
+    print("[2c] replayed ref refused (409)")
 
     def b64i(i):
         return base64.urlsafe_b64encode(i.to_bytes((i.bit_length() + 7) // 8, "big")).decode().rstrip("=")
 
-    s, r = post("/v1/blind-sign", {"blinded_message": b64i(blinded), "amount": 1})
-    assert s == 200, r
-    sig_int = int.from_bytes(base64.urlsafe_b64decode(r["blind_signature"] + "=="), "big")
-    sig = sig_int * pow(rr, -1, n) % n
-    ok = pow(sig, e, n) == m
-    print(f"[3] Python unblinded Go's RSA-2048 signature, verifies: {ok}")
-    assert ok
+    def issue(secret):
+        """Full client side of the blind protocol: returns a proof the kiosk signed blind."""
+        m = int.from_bytes(hashlib.sha256(secret.encode()).digest(), "big") % n
+        if m < 2:
+            m = 2
+        while True:
+            rr = random.randrange(2, n - 1)
+            if math.gcd(rr, n) == 1:
+                break
+        blinded = pow(m * pow(rr, e, n), 1, n)
+        st, rsp = post("/v1/blind-sign", {"blinded_message": b64i(blinded), "amount": 1})
+        assert st == 200, rsp
+        sig_int = int.from_bytes(base64.urlsafe_b64decode(rsp["blind_signature"] + "=="), "big")
+        sg = sig_int * pow(rr, -1, n) % n
+        assert pow(sg, e, n) == m, "unblinded signature does not verify"
+        return {"secret": secret, "sig": b64i(sg), "n": b64i(n), "e": e}
 
-    proof = {"secret": secret, "sig": b64i(sig), "n": b64i(n), "e": e}
+    secret = "cross-lang-token-001"
+    proof = issue(secret)
+    print("[3] Python unblinded Go's RSA-2048 signature, verifies: True")
     s, r = post("/v1/settle", proof)
     print(f"[4] settle: HTTP {s} -> {r['result']}")
     if s != 200:
@@ -93,9 +110,13 @@ def main():
     print(f"[5] replay:  HTTP {s} -> {r['result']}")
     assert s == 409
 
-    s, r = post("/v1/settle", dict(proof, secret="stolen-002", sig=b64i(sig),
-                                   p2pk="shop", claimer="thief"))
-    print(f"[6] thief P2PK: HTTP {s} -> {r['result']}")
+    # A locked secret (lock key = 32 bytes of hex) cannot be claimed without that key's signature.
+    locked = issue("cross-lang-locked-003|lock=" + "11" * 32)
+    s, r = post("/v1/settle", dict(locked, p2pk="shop", claimer="thief"))
+    print(f"[6] locked proof, thief label: HTTP {s} -> {r['result']}")
+    assert s == 409
+    s, r = post("/v1/settle", dict(locked, claimer="ab" * 64))
+    print(f"[7] locked proof, forged claim signature: HTTP {s} -> {r['result']}")
     assert s == 409
 
     print("\nCROSS-LANGUAGE INTEROP: ALL PASS (Python + Go, RSA-2048, HTTPS/TLS)")

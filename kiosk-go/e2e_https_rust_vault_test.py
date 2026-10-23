@@ -1,266 +1,253 @@
-r"""End-to-end integration test: Self-Contained Go HTTPS ATM <-> Lightweight Rust Vault.
+r"""End-to-end integration test: Go HTTPS ATM <-> Rust Vault over real TLS.
 
-Tests the full FUPI payment lifecycle over real TLS / HTTPS:
-  1. Inbound fiat reserve funding at Go HTTPS ATM
-  2. Public keyset retrieval over TLS
-  3. Chaum blind-signing (RSA-2048) over HTTPS
-  4. Rust vault unblinding, on-chip signature verification, and atomic flash persistence
-  5. Bearer token spending and P2PK key locking
-  6. Recipient offline verification (zero network needed)
-  7. Final settlement at Go HTTPS ATM over TLS
-  8. Replay attack rejection (double-spend protection, HTTP 409)
-  9. Unauthorized P2PK claimer rejection (HTTP 409)
- 10. Legitimate P2PK settlement (HTTP 200)
+Build first:
+  (cd kiosk-go && go build -o kiosk-go .)
+  (cd vault-rust && cargo build)
+Run:
+  python kiosk-go/e2e_https_rust_vault_test.py
+
+Covers the hardened flow:
+   1. Kiosk boots with a credit secret; vault trusts ONLY the pinned TLS fingerprint
+   2. TLS: strict default and a wrong pin are both refused for the self-signed kiosk
+   3. Reserve funding is HMAC-authenticated; replayed reference and missing secret are refused
+   4. Blind top-up, balance, reconcile endpoint
+   5. P2PK locks are real: claim signature required, wrong key / no key / stripped lock refused
+   6. Offline verify, replay (double-spend) rejection, token outbox
+   7. Peer-to-peer offline receive, forged tokens (e=1, fake modulus) rejected
+   8. 5-way concurrent settle race: exactly one winner
 """
 
+import base64
+import concurrent.futures
+import json
 import os
+import re
 import ssl
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 
 PORT = 8896
 ATM_URL = f"https://127.0.0.1:{PORT}"
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-KIOSK_EXE = os.path.join(ROOT_DIR, "kiosk-go", "kiosk-go.exe")
-VAULT_EXE = os.path.join(ROOT_DIR, "vault-rust", "target", "debug", "fupi-vault.exe")
+EXE = ".exe" if os.name == "nt" else ""
+KIOSK_EXE = os.path.join(ROOT_DIR, "kiosk-go", "kiosk-go" + EXE)
+VAULT_EXE = os.path.join(ROOT_DIR, "vault-rust", "target", "debug", "fupi-vault" + EXE)
 TEST_STATE = os.path.join(ROOT_DIR, "test_atm_state_e2e.json")
-TEST_FLASH = os.path.join(ROOT_DIR, "test_vault_flash_e2e.json")
-TEST_FLASH_BOB = os.path.join(ROOT_DIR, "test_vault_flash_bob_e2e.json")
+FLASH = {
+    "alice": os.path.join(ROOT_DIR, "test_vault_flash_alice_e2e.json"),
+    "bob": os.path.join(ROOT_DIR, "test_vault_flash_bob_e2e.json"),
+}
+CREDIT_SECRET = "e2e-credit-secret-not-for-production"
 
-SSL_CTX = ssl.create_default_context()
-SSL_CTX.check_hostname = False
-SSL_CTX.verify_mode = ssl.CERT_NONE
+# Only used to READ the kiosk fingerprint on localhost; the vault itself pins it.
+INSECURE_CTX = ssl.create_default_context()
+INSECURE_CTX.check_hostname = False
+INSECURE_CTX.verify_mode = ssl.CERT_NONE
+
+PIN = None  # set once the kiosk is up
 
 
 def cleanup():
-    stems = [
-        TEST_STATE, TEST_FLASH, TEST_FLASH_BOB,
-        os.path.splitext(TEST_STATE)[0],
-        os.path.splitext(TEST_FLASH)[0],
-        os.path.splitext(TEST_FLASH_BOB)[0],
-    ]
-    for s in stems:
-        for ext in ["", ".json", ".tmp", ".bak"]:
-            f = s + ext
-            if os.path.exists(f):
-                try:
-                    os.remove(f)
-                except Exception:
-                    pass
+    for base in [TEST_STATE] + list(FLASH.values()):
+        for ext in ["", ".tmp", ".bak"]:
+            try:
+                os.remove(base + ext)
+            except OSError:
+                pass
+        stem = os.path.splitext(base)[0]
+        for ext in [".tmp", ".bak"]:
+            try:
+                os.remove(stem + ext)
+            except OSError:
+                pass
 
 
-def wait_for_atm(proc, timeout=10):
+def http_json(path):
+    with urllib.request.urlopen(ATM_URL + path, timeout=3, context=INSECURE_CTX) as r:
+        return json.loads(r.read().decode())
+
+
+def wait_for_atm(proc, timeout=15):
     start = time.time()
     while time.time() - start < timeout:
         if proc.poll() is not None:
-            raise RuntimeError(f"Go HTTPS ATM process exited prematurely with code {proc.returncode}")
+            raise RuntimeError(f"kiosk exited early with code {proc.returncode}")
         try:
-            req = urllib.request.Request(f"{ATM_URL}/v1/info")
-            with urllib.request.urlopen(req, timeout=1, context=SSL_CTX) as r:
-                if r.status == 200:
-                    return True
+            http_json("/v1/info")
+            return True
         except Exception:
             time.sleep(0.15)
     return False
 
 
-def run_vault(*args, check=True):
-    cmd = [VAULT_EXE] + list(args) + [
-        "--atm", ATM_URL,
-        "--flash", TEST_FLASH,
-        "--insecure",
-    ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+def vault(who, *args, tls="pin", env=None, check=True):
+    cmd = [VAULT_EXE] + list(args) + ["--atm", ATM_URL, "--flash", FLASH[who]]
+    if tls == "pin":
+        cmd += ["--pin-tls", PIN]
+    elif tls == "badpin":
+        cmd += ["--pin-tls", "00" * 32]
+    elif tls == "insecure":
+        cmd += ["--insecure"]
+    # tls == "strict": no TLS flag at all (default must refuse a self-signed cert)
+    e = dict(os.environ)
+    e.pop("FUPI_CREDIT_SECRET", None)
+    if env:
+        e.update(env)
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
     if check and res.returncode != 0:
-        print(f"FAILED cmd: {' '.join(cmd)}")
-        print(f"STDOUT: {res.stdout}")
-        print(f"STDERR: {res.stderr}")
-        raise RuntimeError(f"Vault command failed with code {res.returncode}")
+        print(f"FAILED cmd: {' '.join(cmd)}\nSTDOUT: {res.stdout}\nSTDERR: {res.stderr}")
+        raise RuntimeError(f"vault command failed with code {res.returncode}")
     return res
 
 
-def run_vault_bob(*args, check=True):
-    cmd = [VAULT_EXE] + list(args) + [
-        "--atm", ATM_URL,
-        "--flash", TEST_FLASH_BOB,
-        "--insecure",
-    ]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if check and res.returncode != 0:
-        print(f"FAILED cmd: {' '.join(cmd)}")
-        print(f"STDOUT: {res.stdout}")
-        print(f"STDERR: {res.stderr}")
-        raise RuntimeError(f"Bob's Vault command failed with code {res.returncode}")
-    return res
+def last_line(res):
+    return res.stdout.strip().splitlines()[-1]
+
+
+def keygen():
+    out = vault("alice", "keygen").stdout
+    pk = re.search(r"public_key=([0-9a-f]{64})", out).group(1)
+    sk = re.search(r"secret_key=([0-9a-f]{64})", out).group(1)
+    return sk, pk
+
+
+def step(n, title):
+    print(f"\n[Step {n}] {title}")
 
 
 def main():
-    print("=================================================================")
-    print("  FUPI End-to-End Test: Go HTTPS ATM <-> Lightweight Rust Vault  ")
-    print("=================================================================")
+    global PIN
+    print("=" * 65)
+    print("  FUPI End-to-End Test: Go HTTPS ATM <-> Rust Vault (hardened)")
+    print("=" * 65)
+    for exe in (KIOSK_EXE, VAULT_EXE):
+        if not os.path.exists(exe):
+            sys.exit(f"missing binary {exe}; see build instructions at the top of this file")
     cleanup()
 
-    # 1. Start Go HTTPS ATM
-    print(f"\n[Step 1] Booting Go HTTPS ATM on port {PORT} with self-contained TLS...")
-    kiosk_proc = subprocess.Popen(
+    step(1, f"Booting kiosk on :{PORT} with TLS and a credit secret...")
+    env = dict(os.environ, FUPI_CREDIT_SECRET=CREDIT_SECRET)
+    kiosk = subprocess.Popen(
         [KIOSK_EXE, "-port", str(PORT), "-tls=true", "-state", TEST_STATE, "-save-cert=false"],
-        cwd=os.path.join(ROOT_DIR, "kiosk-go"),
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        cwd=os.path.join(ROOT_DIR, "kiosk-go"), env=env,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-
     try:
-        if not wait_for_atm(kiosk_proc):
-            raise RuntimeError("Go HTTPS ATM failed to start or respond to TLS handshake")
-        print("  -> Go HTTPS ATM is live and serving TLS!")
+        if not wait_for_atm(kiosk):
+            raise RuntimeError("kiosk did not come up")
+        PIN = http_json("/v1/info")["tls_fingerprint_sha256"]
+        print(f"  -> kiosk up; TLS fingerprint {PIN[:16]}...")
 
-        # 2. Query ATM info via Rust Vault
-        print("\n[Step 2] Querying ATM status & TLS fingerprint via Rust vault...")
-        res = run_vault("info")
-        print(res.stdout.strip())
+        step(2, "TLS trust: strict default and a wrong pin must both be REFUSED")
+        assert vault("alice", "info", tls="strict", check=False).returncode != 0, \
+            "strict TLS accepted a self-signed certificate"
+        assert vault("alice", "info", tls="badpin", check=False).returncode != 0, \
+            "a wrong pin was accepted"
+        res = vault("alice", "info")
         assert "TLS Active: true" in res.stdout
-        assert "FUPI Self-Contained Go HTTPS ATM" in res.stdout
+        print("  -> only the pinned certificate is trusted")
 
-        # 3. Fund ATM reserve (bank rail simulation)
-        print("\n[Step 3] Funding ATM fiat reserve (+100.00)...")
-        res = run_vault("bank", "100")
-        print(res.stdout.strip())
-        assert "100.00" in res.stdout
+        step(3, "Reserve funding is authenticated and idempotent")
+        assert vault("alice", "bank", "100", "--ref", "UTR-1", check=False).returncode != 0, \
+            "credit without FUPI_CREDIT_SECRET should fail client-side"
+        assert vault("alice", "bank", "100", "--ref", "UTR-1",
+                     env={"FUPI_CREDIT_SECRET": "wrong"}, check=False).returncode != 0, \
+            "credit with the wrong secret was accepted"
+        good = {"FUPI_CREDIT_SECRET": CREDIT_SECRET}
+        assert "100.00" in vault("alice", "bank", "100", "--ref", "UTR-1", env=good).stdout
+        assert vault("alice", "bank", "100", "--ref", "UTR-1", env=good, check=False).returncode != 0, \
+            "replayed bank reference was credited twice"
+        rc = http_json("/v1/reconcile")
+        assert rc["reserve"] == 100.0 and rc["deposit_count"] == 1, rc
+        print(f"  -> reserve stays 100.00 after replay; reconcile: {rc}")
 
-        # 4. Topup: withdraw 5 blind-signed proofs
-        print("\n[Step 4] Withdrawing 5 blind-signed bearer proofs (Chaum RSA-2048)...")
-        res = run_vault("topup", "5")
-        print(res.stdout.strip())
-        assert "topup +5 proofs" in res.stdout
+        step(4, "Blind top-up of 5 plain proofs")
+        assert "topup +5 proofs" in vault("alice", "topup", "5").stdout
+        assert int(vault("alice", "balance").stdout.strip()) == 5
+        rc = http_json("/v1/reconcile")
+        assert rc["issued_outstanding"] == 5 and rc["fully_backed"] and rc["ledger_consistent"], rc
 
-        # 5. Check vault balance
-        print("\n[Step 5] Checking Rust vault bearer balance...")
-        res = run_vault("balance")
-        bal = int(res.stdout.strip())
-        print(f"  -> Active bearer balance: {bal}")
-        assert bal == 5
+        step(5, "Real P2PK: proofs locked to Charlie's ed25519 key at issuance")
+        sk_charlie, pk_charlie = keygen()
+        assert "topup +2 proofs" in vault("alice", "topup", "2", "--lock", pk_charlie).stdout
+        assert int(vault("alice", "balance").stdout.strip()) == 7
+        token_charlie = last_line(vault("alice", "pay", "2", "--p2pk", pk_charlie))
+        assert int(vault("alice", "balance").stdout.strip()) == 5
+        res = vault("alice", "verify", token_charlie)
+        assert "VERIFIED: 2 valid proof(s)" in res.stdout and pk_charlie in res.stdout
+        print("  -> offline verify OK, lock visible inside the secret")
 
-        # 6. Make payment of 2 tokens locked to 'merchant-charlie'
-        print("\n[Step 6] Spending 2 tokens locked to P2PK key 'merchant-charlie'...")
-        res = run_vault("pay", "2", "--p2pk", "merchant-charlie")
-        token_charlie = res.stdout.strip().splitlines()[-1]
-        print(f"  -> Generated Bearer Token: {token_charlie[:40]}... (length {len(token_charlie)})")
+        # No claim key / the wrong key: refused. The lock cannot be stripped or relabelled.
+        r = vault("alice", "settle", token_charlie, check=False)
+        assert r.returncode != 0 and "SETTLE REJECTED" in r.stdout, r.stdout
+        sk_thief, _ = keygen()
+        r = vault("alice", "settle", token_charlie, "--claim-key", sk_thief, check=False)
+        assert r.returncode != 0 and "SETTLE REJECTED" in r.stdout, r.stdout
+        proofs = json.loads(base64.urlsafe_b64decode(token_charlie + "=" * (-len(token_charlie) % 4)))
+        for p in proofs:  # attacker deletes lock fields / swaps in labels: nothing changes
+            p.pop("p2pk", None)
+            p["claimer"] = pk_charlie
+            p["p2pk"] = pk_charlie
+        relabelled = base64.urlsafe_b64encode(json.dumps(proofs).encode()).decode().rstrip("=")
+        r = vault("alice", "settle", relabelled, check=False)
+        assert r.returncode != 0 and "SETTLE REJECTED" in r.stdout, r.stdout
+        print("  -> no key / wrong key / relabelled token all REJECTED")
 
-        res_bal = run_vault("balance")
-        assert int(res_bal.stdout.strip()) == 3
-        print(f"  -> Remaining vault balance: 3")
+        res = vault("alice", "settle", token_charlie, "--claim-key", sk_charlie)
+        assert res.stdout.count("SETTLED OK") == 2, res.stdout
+        print("  -> Charlie's claim signature settles it")
 
-        # 7. Recipient verifies token OFFLINE (zero network)
-        print("\n[Step 7] Recipient verifies token OFFLINE (zero network access)...")
-        res_verify = run_vault("verify", token_charlie)
-        print(res_verify.stdout.strip())
-        assert "VERIFIED: 2 valid proof(s)" in res_verify.stdout
-        assert "merchant-charlie" in res_verify.stdout
+        step(6, "Double-spend replay rejected; outbox keeps the emitted tokens")
+        r = vault("alice", "settle", token_charlie, "--claim-key", sk_charlie, check=False)
+        assert r.returncode != 0 and "SETTLE REJECTED" in r.stdout
+        out = vault("alice", "outbox").stdout
+        assert token_charlie in out, "emitted token missing from outbox"
+        assert "outbox entry 1 acknowledged" in vault("alice", "ack", "1").stdout
+        print("  -> replay blocked; token was recoverable from the outbox until acked")
 
-        # 8. Settle token at Go HTTPS ATM (legitimate claimer)
-        print("\n[Step 8] Settling token at Go HTTPS ATM with claimer 'merchant-charlie'...")
-        res_settle = run_vault("settle", token_charlie, "--claimer", "merchant-charlie")
-        print(res_settle.stdout.strip())
-        assert "SETTLED OK" in res_settle.stdout
+        step(7, "Peer-to-peer offline hand-over to Bob")
+        vault("alice", "topup", "1")
+        token_to_bob = last_line(vault("alice", "pay", "1"))
+        # Bob has no pinned keyset yet: receive pins it from the (TLS-pinned) kiosk.
+        assert "received +1 proofs" in vault("bob", "receive", token_to_bob).stdout
+        assert int(vault("bob", "balance").stdout.strip()) == 1
+        assert "SETTLED OK" in vault("bob", "settle", token_to_bob).stdout
+        print("  -> Bob received offline and settled")
 
-        # 9. Double-spend / replay attack rejection
-        print("\n[Step 9] Testing Double-Spend Rejection (replay attack)...")
-        res_replay = run_vault("settle", token_charlie, "--claimer", "merchant-charlie", check=False)
-        print(f"  Exit code: {res_replay.returncode} (expected error code 2)")
-        print(f"  Output: {res_replay.stdout.strip()}")
-        assert res_replay.returncode != 0
-        assert "SETTLE REJECTED" in res_replay.stdout
-        print("  -> Double-spend successfully BLOCKED by Go ATM (HTTP 409)!")
+        step(8, "Forged tokens are rejected (fake modulus, e=1)")
+        def forge(**kw):
+            base = {"secret": "fupi-counterfeit-cash-e2e", "sig": "AQIDBAU=", "e": 65537,
+                    "keyset_id": "go-mvp-00"}
+            base.update(kw)
+            return base64.urlsafe_b64encode(json.dumps([base]).encode()).decode().rstrip("=")
+        assert vault("alice", "verify", forge(n="FAKE_MODULUS_N"), check=False).returncode != 0
+        assert vault("alice", "verify", forge(e=1), check=False).returncode != 0
+        print("  -> forged tokens rejected")
 
-        # 10. Test P2PK theft protection
-        print("\n[Step 10] Testing P2PK theft protection...")
-        res_p2pk = run_vault("pay", "1", "--p2pk", "legitimate-owner")
-        token_p2pk = res_p2pk.stdout.strip().splitlines()[-1]
+        step(9, "5 concurrent settles of one token: exactly one winner")
+        vault("alice", "topup", "1")
+        race = last_line(vault("alice", "pay", "1"))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as ex:
+            results = list(ex.map(lambda _: vault("alice", "settle", race, check=False), range(5)))
+        ok = sum(1 for r in results if r.returncode == 0)
+        assert ok == 1, f"expected exactly 1 winner, got {ok}"
+        print("  -> exactly 1 winner, 4 rejected")
 
-        # Thief tries to claim it
-        res_thief = run_vault("settle", token_p2pk, "--claimer", "thief", check=False)
-        print(f"  Thief claim exit code: {res_thief.returncode}")
-        print(f"  Thief claim output: {res_thief.stdout.strip()}")
-        assert res_thief.returncode != 0
-        assert "SETTLE REJECTED" in res_thief.stdout
-
-        # Legitimate owner claims it
-        res_owner = run_vault("settle", token_p2pk, "--claimer", "legitimate-owner")
-        print(f"  Legitimate claim: {res_owner.stdout.strip()}")
-        assert "SETTLED OK" in res_owner.stdout
-
-        # 11. Peer-to-peer offline transfer and receive into Bob's vault
-        print("\n[Step 11] Testing Peer-to-Peer Offline Transfer -> Bob's Vault Receive...")
-        # Topup 1 more token into Alice's vault
-        run_vault("topup", "1")
-        res_alice_pay = run_vault("pay", "1")
-        token_to_bob = res_alice_pay.stdout.strip().splitlines()[-1]
-
-        # Bob receives the token into Bob's flash vault offline
-        res_bob_recv = run_vault_bob("receive", token_to_bob)
-        print(f"  Bob receive output: {res_bob_recv.stdout.strip()}")
-        assert "received +1 proofs" in res_bob_recv.stdout
-
-        res_bob_bal = run_vault_bob("balance")
-        assert int(res_bob_bal.stdout.strip()) == 1
-        print("  -> Bob's offline vault balance confirmed: 1")
-
-        # Bob now settles his received token at the Go HTTPS ATM
-        res_bob_settle = run_vault_bob("settle", token_to_bob)
-        print(f"  Bob settle output: {res_bob_settle.stdout.strip()}")
-        assert "SETTLED OK" in res_bob_settle.stdout
-
-        # 12. Forged token with counterfeit modulus rejection
-        print("\n[Step 12] Testing Forged Token Rejection (counterfeit modulus)...")
-        import base64
-        import json
-        fake_proof = [{
-            "secret": "fupi-counterfeit-cash-e2e",
-            "sig": "AQIDBAU=",
-            "n": "FAKE_MODULUS_N",
-            "e": 65537,
-            "keyset_id": "go-mvp-00",
-        }]
-        fake_token = base64.urlsafe_b64encode(json.dumps(fake_proof).encode()).decode().rstrip("=")
-        res_fake = run_vault("verify", fake_token, check=False)
-        print(f"  Fake token verify exit code: {res_fake.returncode}")
-        assert res_fake.returncode != 0
-        print("  -> Forged token with fake modulus successfully rejected!")
-
-        # 13. Concurrency double-spend stress test over HTTPS
-        print("\n[Step 13] Testing Concurrent Double-Spend Settlement Race (5 parallel HTTPS threads)...")
-        run_vault("topup", "1")
-        res_race_token = run_vault("pay", "1")
-        race_token = res_race_token.stdout.strip().splitlines()[-1]
-
-        import concurrent.futures
-
-        def attempt_settle():
-            return run_vault("settle", race_token, check=False)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(attempt_settle) for _ in range(5)]
-            results = [f.result() for f in futures]
-
-        settled_ok = [r for r in results if r.returncode == 0]
-        settled_rej = [r for r in results if r.returncode != 0]
-        print(f"  Concurrent settlements: {len(settled_ok)} OK, {len(settled_rej)} REJECTED")
-        assert len(settled_ok) == 1, f"Expected exactly 1 OK, got {len(settled_ok)}"
-        assert len(settled_rej) == 4, f"Expected 4 rejected, got {len(settled_rej)}"
-        print("  -> Concurrent double-spend race test PASSED: strictly 1 winner!")
-
-        print("\n=================================================================")
-        print("  ALL 13 TESTS PASSED: Go HTTPS ATM <-> Rust Vault Interop Verified! ")
-        print("=================================================================\n")
-
+        rc = http_json("/v1/reconcile")
+        assert rc["fully_backed"] and rc["ledger_consistent"], rc
+        print(f"\nFinal reconcile: {rc}")
+        print("\n" + "=" * 65)
+        print("  ALL E2E STEPS PASSED")
+        print("=" * 65)
     finally:
-        kiosk_proc.terminate()
+        kiosk.terminate()
         try:
-            kiosk_proc.wait(timeout=3)
+            kiosk.wait(timeout=3)
         except Exception:
-            kiosk_proc.kill()
+            kiosk.kill()
         cleanup()
 
 

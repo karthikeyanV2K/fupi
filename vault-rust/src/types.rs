@@ -46,11 +46,19 @@ pub struct FlashState {
     pub journal: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_keyset: Option<Keyset>,
+    /// Bearer tokens that were emitted by `pay` and not yet acknowledged.
+    /// Written in the SAME atomic save that removes the proofs, so a lost
+    /// terminal/QR never destroys money: `outbox` re-shows the token.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outbox: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreditRequest {
     pub amount: f64,
+    /// Unique external payment reference (bank UTR / order id). Replays are rejected.
+    #[serde(rename = "ref")]
+    pub reference: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

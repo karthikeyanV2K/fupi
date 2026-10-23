@@ -29,3 +29,6 @@ test_*.json
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Local build outputs
+kiosk-go/kiosk-go

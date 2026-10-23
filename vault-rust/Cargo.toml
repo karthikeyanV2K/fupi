@@ -16,3 +16,5 @@ ureq = { version = "2.10", features = ["tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1.0"
 webpki-roots = "0.26"
+hmac = "0.12"
+ed25519-dalek = { version = "2", features = ["rand_core"] }

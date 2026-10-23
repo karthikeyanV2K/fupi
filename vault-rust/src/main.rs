@@ -1,4 +1,5 @@
-use fupi_vault::client::AtmClient;
+use fupi_vault::client::{AtmClient, TlsMode};
+use fupi_vault::crypto::{generate_claim_keypair, lock_of, modulus_fingerprint};
 use fupi_vault::storage::FlashStorage;
 use fupi_vault::vault::Vault;
 use std::env;
@@ -15,24 +16,32 @@ Usage:
   fupi-vault <subcommand> [options]
 
 Subcommands:
-  topup <amount>       Withdraw <amount> blind-signed bearer proofs from ATM
-  pay <amount>         Spend <amount> tokens (emits bearer payment token)
+  pin [--force]        Pin the ATM's signing keyset (prints its fingerprint to verify out-of-band)
+  topup <amount>       Withdraw <amount> blind-signed bearer proofs from ATM (--lock <pubkey> to lock them)
+  pay <amount>         Spend <amount> proofs; --p2pk <pubkey> spends proofs locked to that key
+  outbox               List emitted tokens not yet acknowledged (never lose a token you generated)
+  ack <n>              Drop token #n from the outbox once the receiver has it
   receive <token>      Receive/import verified bearer tokens into vault (OFFLINE)
   balance              Show current active bearer token count
   verify <token>       Verify a received token locally (OFFLINE, zero network)
-  settle <token>       Settle/redeem a bearer token at the Go HTTPS ATM
-  bank <amount>        Fund the ATM fiat reserve (inbound bank rail simulation)
-  info                 Query ATM status and TLS security certificate metadata
+  settle <token>       Settle/redeem a bearer token at the ATM (--claim-key <hex> for locked proofs)
+  keygen               Generate an ed25519 claim keypair for P2PK-locked proofs
+  bank <amount>        OPERATOR: credit the ATM reserve (needs FUPI_CREDIT_SECRET; --ref <unique id>)
+  info                 Query ATM status and TLS certificate fingerprint
   status               Display detailed vault balance, journal, and flash path
   wipe                 Wipe all proofs and journal from flash memory
-  repl                 Enter interactive terminal REPL (matches Pico W commands)
+  repl                 Enter interactive terminal REPL
 
 Flags:
   --atm <url>          ATM endpoint (default: https://127.0.0.1:8890)
   --flash <file>       Flash storage path (default: vault_flash.json)
-  --p2pk <pubkey>      Lock payment to a specific recipient public key
-  --claimer <pubkey>   Specify claimer identity when settling P2PK-locked tokens
-  --insecure           Accept self-signed TLS certificates from local/RPi ATM (default: true)
+  --pin-tls <sha256>   Trust ONLY the ATM TLS certificate with this SHA-256 fingerprint (self-signed kiosk)
+  --insecure           DANGEROUS: accept any TLS certificate (local development only)
+  --p2pk <pubkey>      (pay) spend proofs locked to this ed25519 public key (hex)
+  --lock <pubkey>      (topup) lock new proofs to this ed25519 public key (hex)
+  --claim-key <hex>    (settle) ed25519 secret key that signs claims for locked proofs
+  --ref <id>           (bank) unique payment reference; replays are rejected
+  --force              (pin) replace an already pinned keyset
 "#
     );
 }
@@ -43,7 +52,11 @@ struct Config {
     atm_url: String,
     flash_path: PathBuf,
     p2pk: Option<String>,
-    claimer: Option<String>,
+    lock: Option<String>,
+    claim_key: Option<String>,
+    pin_tls: Option<String>,
+    reference: Option<String>,
+    force: bool,
     insecure: bool,
 }
 
@@ -63,8 +76,12 @@ fn parse_cli() -> Option<Config> {
     let mut atm_url = "https://127.0.0.1:8890".to_string();
     let mut flash_path = PathBuf::from("vault_flash.json");
     let mut p2pk = None;
-    let mut claimer = None;
-    let mut insecure = true; // default true for self-contained local ATM
+    let mut lock = None;
+    let mut claim_key = None;
+    let mut pin_tls = None;
+    let mut reference = None;
+    let mut force = false;
+    let mut insecure = false; // strict TLS unless explicitly relaxed
 
     let mut i = 0;
     while i < raw_args.len() {
@@ -78,9 +95,21 @@ fn parse_cli() -> Option<Config> {
         } else if arg == "--p2pk" && i + 1 < raw_args.len() {
             p2pk = Some(raw_args[i + 1].clone());
             i += 2;
-        } else if arg == "--claimer" && i + 1 < raw_args.len() {
-            claimer = Some(raw_args[i + 1].clone());
+        } else if arg == "--lock" && i + 1 < raw_args.len() {
+            lock = Some(raw_args[i + 1].clone());
             i += 2;
+        } else if arg == "--claim-key" && i + 1 < raw_args.len() {
+            claim_key = Some(raw_args[i + 1].clone());
+            i += 2;
+        } else if arg == "--pin-tls" && i + 1 < raw_args.len() {
+            pin_tls = Some(raw_args[i + 1].clone());
+            i += 2;
+        } else if arg == "--ref" && i + 1 < raw_args.len() {
+            reference = Some(raw_args[i + 1].clone());
+            i += 2;
+        } else if arg == "--force" {
+            force = true;
+            i += 1;
         } else if arg == "--insecure" {
             insecure = true;
             i += 1;
@@ -109,9 +138,27 @@ fn parse_cli() -> Option<Config> {
         atm_url,
         flash_path,
         p2pk,
-        claimer,
+        lock,
+        claim_key,
+        pin_tls,
+        reference,
+        force,
         insecure,
     })
+}
+
+/// Operator-only: credit the reserve for a verified inbound payment.
+fn do_credit(client: &AtmClient, amount: f64, reference: Option<String>) -> Result<f64, String> {
+    let secret = std::env::var("FUPI_CREDIT_SECRET")
+        .map_err(|_| "set FUPI_CREDIT_SECRET (same value the kiosk was started with)".to_string())?;
+    let reference = reference.unwrap_or_else(|| {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("cli-{ns}")
+    });
+    client.credit_reserve(amount, &reference, &secret).map_err(|e| e.to_string())
 }
 
 fn run_repl(mut vault: Vault, atm_url: String, insecure: bool) {
@@ -167,7 +214,7 @@ fn run_repl(mut vault: Vault, atm_url: String, insecure: bool) {
             }
             "PAY" => {
                 if parts.len() < 2 {
-                    println!("Usage: PAY <amount> [p2pk]");
+                    println!("Usage: PAY <amount> [lock-pubkey-hex]");
                     continue;
                 }
                 let amount: usize = match parts[1].parse() {
@@ -205,7 +252,7 @@ fn run_repl(mut vault: Vault, atm_url: String, insecure: bool) {
                     }
                 };
                 if let Some(client) = vault.client() {
-                    match client.credit_reserve(amount) {
+                    match do_credit(client, amount, None) {
                         Ok(res) => println!("BANK CREDIT SUCCESS: reserve = {res:.2}"),
                         Err(e) => println!("BANK CREDIT FAILED: {e}"),
                     }
@@ -215,16 +262,16 @@ fn run_repl(mut vault: Vault, atm_url: String, insecure: bool) {
             }
             "SETTLE" => {
                 if parts.len() < 2 {
-                    println!("Usage: SETTLE <token> [claimer]");
+                    println!("Usage: SETTLE <token> [claim-key-hex]");
                     continue;
                 }
                 let token = parts[1];
-                let claimer = if parts.len() >= 3 {
+                let claim_key = if parts.len() >= 3 {
                     Some(parts[2].to_string())
                 } else {
                     None
                 };
-                match vault.settle_token(token, claimer) {
+                match vault.settle_token(token, claim_key) {
                     Ok(res) => {
                         for (sec, ok, msg) in res {
                             println!("[SETTLE] secret={} success={} msg={}", sec, ok, msg);
@@ -285,7 +332,21 @@ fn main() {
         None => return,
     };
 
-    let client = AtmClient::new(&cfg.atm_url, cfg.insecure).ok();
+    let tls = if let Some(fp) = cfg.pin_tls.clone() {
+        TlsMode::Pinned(fp)
+    } else if cfg.insecure {
+        eprintln!("[warn] --insecure: TLS certificate is NOT being verified");
+        TlsMode::Insecure
+    } else {
+        TlsMode::Strict
+    };
+    let client = match AtmClient::with_tls(&cfg.atm_url, tls) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            eprintln!("[warn] could not build ATM client: {e}");
+            None
+        }
+    };
     let storage = FlashStorage::new(&cfg.flash_path);
     let mut vault = match Vault::new(storage, client) {
         Ok(v) => v,
@@ -317,7 +378,7 @@ fn main() {
                 eprintln!("Invalid topup amount: {}", cfg.args[0]);
                 std::process::exit(1);
             });
-            match vault.topup(amount) {
+            match vault.topup_locked(amount, cfg.lock.clone()) {
                 Ok(n) => {
                     println!("[vault] topup +{n} proofs (balance {})", vault.balance());
                 }
@@ -329,7 +390,7 @@ fn main() {
         }
         "pay" => {
             if cfg.args.is_empty() {
-                eprintln!("Usage: fupi-vault pay <amount> [--p2pk <recipient>]");
+                eprintln!("Usage: fupi-vault pay <amount> [--p2pk <pubkey-hex>]");
                 std::process::exit(1);
             }
             let amount: usize = cfg.args[0].parse().unwrap_or_else(|_| {
@@ -339,6 +400,7 @@ fn main() {
             match vault.make_payment(amount, cfg.p2pk) {
                 Ok(token) => {
                     println!("{token}");
+                    eprintln!("[vault] token saved in outbox; run `outbox` to re-show it, `ack <n>` once delivered");
                 }
                 Err(e) => {
                     eprintln!("Payment failed: {e}");
@@ -386,10 +448,9 @@ fn main() {
                 Ok(proofs) => {
                     println!("VERIFIED: {} valid proof(s)", proofs.len());
                     for (i, p) in proofs.iter().enumerate() {
-                        let lock_info = if let Some(ref pk) = p.p2pk {
-                            format!(" [P2PK locked to: {pk}]")
-                        } else {
-                            "".into()
+                        let lock_info = match lock_of(&p.secret) {
+                            Ok(Some(pk)) => format!(" [P2PK locked to: {}]", fupi_vault::crypto::hex_encode(&pk)),
+                            _ => "".into(),
                         };
                         println!("  Proof #{}: secret={}{}", i + 1, p.secret, lock_info);
                     }
@@ -402,11 +463,11 @@ fn main() {
         }
         "settle" => {
             if cfg.args.is_empty() {
-                eprintln!("Usage: fupi-vault settle <token> [--claimer <name>]");
+                eprintln!("Usage: fupi-vault settle <token> [--claim-key <hex>]");
                 std::process::exit(1);
             }
             let token = &cfg.args[0];
-            match vault.settle_token(token, cfg.claimer) {
+            match vault.settle_token(token, cfg.claim_key.clone()) {
                 Ok(results) => {
                     let mut any_failed = false;
                     for (sec, ok, msg) in results {
@@ -437,7 +498,7 @@ fn main() {
                 std::process::exit(1);
             });
             if let Some(client) = vault.client() {
-                match client.credit_reserve(amount) {
+                match do_credit(client, amount, cfg.reference.clone()) {
                     Ok(reserve) => println!("ATM Reserve credited: {reserve:.2}"),
                     Err(e) => {
                         eprintln!("Bank credit failed: {e}");
@@ -447,6 +508,60 @@ fn main() {
             } else {
                 eprintln!("No ATM client configured");
                 std::process::exit(1);
+            }
+        }
+        "keygen" => {
+            let (sk, pk) = generate_claim_keypair();
+            println!("public_key={pk}   (give this to whoever issues you locked proofs: topup --lock)");
+            println!("secret_key={sk}   (KEEP PRIVATE: settle --claim-key)");
+        }
+        "pin" => {
+            let client = vault.client().unwrap_or_else(|| {
+                eprintln!("No ATM client configured");
+                std::process::exit(1);
+            });
+            let offered = client.get_keyset().unwrap_or_else(|e| {
+                eprintln!("Could not fetch keyset: {e}");
+                std::process::exit(1);
+            });
+            if !cfg.force {
+                if let Err(e) = Vault::check_keyset_pin(vault.trusted_keyset(), &offered) {
+                    eprintln!("Refusing to change pinned keyset: {e}");
+                    std::process::exit(1);
+                }
+            }
+            let fp = modulus_fingerprint(&offered.n).unwrap_or_default();
+            if let Err(e) = vault.cache_keyset(offered.clone()) {
+                eprintln!("Could not save keyset: {e}");
+                std::process::exit(1);
+            }
+            println!("Pinned keyset '{}' (e={})", offered.keyset_id, offered.e);
+            println!("  modulus SHA-256: {fp}");
+            println!("  Compare this with the value shown by the kiosk operator before trusting it.");
+        }
+        "outbox" => {
+            if vault.outbox().is_empty() {
+                println!("(outbox empty)");
+            }
+            for (i, t) in vault.outbox().iter().enumerate() {
+                println!("[{}] {}", i + 1, t);
+            }
+        }
+        "ack" => {
+            let n: usize = cfg.args.first().and_then(|a| a.parse().ok()).unwrap_or_else(|| {
+                eprintln!("Usage: fupi-vault ack <n>");
+                std::process::exit(1);
+            });
+            match vault.ack_outbox(n) {
+                Ok(true) => println!("outbox entry {n} acknowledged"),
+                Ok(false) => {
+                    eprintln!("no such outbox entry");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("ack failed: {e}");
+                    std::process::exit(1);
+                }
             }
         }
         "info" => {
