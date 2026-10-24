@@ -10,7 +10,8 @@ Covers the hardened flow:
    1. Kiosk boots with a credit secret; vault trusts ONLY the pinned TLS fingerprint
    2. TLS: strict default and a wrong pin are both refused for the self-signed kiosk
    3. Reserve funding is HMAC-authenticated; replayed reference and missing secret are refused
-   4. Blind top-up, balance, reconcile endpoint
+   4. Device identity: unallocated device refused; operator allocates quota; denominated top-up
+   4b. Exact payment, and change-making through /v1/swap when the coins do not add up
    5. P2PK locks are real: claim signature required, wrong key / no key / stripped lock refused
    6. Offline verify, replay (double-spend) rejection, token outbox
    7. Peer-to-peer offline receive, forged tokens (e=1, fake modulus) rejected
@@ -70,7 +71,7 @@ def http_json(path):
         return json.loads(r.read().decode())
 
 
-def wait_for_atm(proc, timeout=15):
+def wait_for_atm(proc, timeout=90):
     start = time.time()
     while time.time() - start < timeout:
         if proc.poll() is not None:
@@ -112,6 +113,16 @@ def keygen():
     pk = re.search(r"public_key=([0-9a-f]{64})", out).group(1)
     sk = re.search(r"secret_key=([0-9a-f]{64})", out).group(1)
     return sk, pk
+
+
+def token_value(tok):
+    """Face value of a token = sum of the denominations named by its keyset ids."""
+    proofs = json.loads(base64.urlsafe_b64decode(tok + "=" * (-len(tok) % 4)))
+    total = 0
+    for p in proofs:
+        kid = p["keyset_id"]
+        total += 1 if kid == "go-mvp-00" else int(kid.rsplit("d", 1)[1])
+    return total
 
 
 def step(n, title):
@@ -164,20 +175,51 @@ def main():
         assert rc["reserve"] == 100.0 and rc["deposit_count"] == 1, rc
         print(f"  -> reserve stays 100.00 after replay; reconcile: {rc}")
 
-        step(4, "Blind top-up of 5 plain proofs")
-        assert "topup +5 proofs" in vault("alice", "topup", "5").stdout
-        assert int(vault("alice", "balance").stdout.strip()) == 5
+        step(4, "Device identity: no quota => no proofs; operator allocates; denominated top-up")
+        assert vault("alice", "credit-dummy", check=False).returncode != 0  # unknown subcommand
+        assert vault("alice", "bank", "400", "--ref", "UTR-2", env=good).returncode == 0
+        pk_dev = re.search(r"device_public_key=([0-9a-f]{64})", vault("alice", "device").stdout).group(1)
+        assert vault("alice", "topup", "10", check=False).returncode != 0, \
+            "a device with no allocation got proofs"
+        assert vault("alice", "allocate", pk_dev, "300", "--ref", "ALLOC-1", check=False).returncode != 0, \
+            "allocation without the operator secret was accepted"
+        assert vault("alice", "allocate", pk_dev, "300", "--ref", "ALLOC-1", env=good).returncode == 0
+        assert vault("alice", "allocate", pk_dev, "300", "--ref", "ALLOC-1", env=good, check=False).returncode != 0, \
+            "replayed allocation ref was accepted"
+        assert vault("alice", "allocate", pk_dev, "9999", "--ref", "ALLOC-2", env=good, check=False).returncode != 0, \
+            "allocation above the reserve was accepted"
+        assert "topup +237" in vault("alice", "topup", "237").stdout
+        assert int(vault("alice", "balance").stdout.strip()) == 237
+        assert "go-mvp-d200" in json.dumps(http_json("/v1/keysets"))
         rc = http_json("/v1/reconcile")
-        assert rc["issued_outstanding"] == 5 and rc["fully_backed"] and rc["ledger_consistent"], rc
+        assert rc["issued_outstanding"] == 237 and rc["fully_backed"] and rc["ledger_consistent"], rc
+        print("  -> 237 loaded as 200+20+10+5+2; reconcile counts money, not proofs")
+
+        step("4b", "Exact payment, then change-making via /v1/swap")
+        tok37 = last_line(vault("alice", "pay", "37"))
+        assert token_value(tok37) == 37
+        assert int(vault("alice", "balance").stdout.strip()) == 200
+        tok40 = last_line(vault("alice", "pay", "40"))  # only a 200 left: must swap
+        assert token_value(tok40) == 40
+        assert int(vault("alice", "balance").stdout.strip()) == 160
+        assert "PENDING" not in vault("alice", "status").stdout
+        res = vault("bob", "receive", tok37)
+        assert "received +4 proofs" in res.stdout, res.stdout
+        assert vault("bob", "settle", tok37).stdout.count("SETTLED OK") == 4
+        assert vault("alice", "settle", tok40).stdout.count("SETTLED OK") == 2
+        rc = http_json("/v1/reconcile")
+        assert rc["issued_outstanding"] == 160 and rc["fully_backed"], rc
+        print("  -> paid 37 exactly, paid 40 after swapping the 200; issued fell by what was settled")
+        vault("bob", "wipe")
 
         step(5, "Real P2PK: proofs locked to Charlie's ed25519 key at issuance")
         sk_charlie, pk_charlie = keygen()
-        assert "topup +2 proofs" in vault("alice", "topup", "2", "--lock", pk_charlie).stdout
-        assert int(vault("alice", "balance").stdout.strip()) == 7
+        assert "topup +2" in vault("alice", "topup", "2", "--lock", pk_charlie).stdout
+        assert int(vault("alice", "balance").stdout.strip()) == 162
         token_charlie = last_line(vault("alice", "pay", "2", "--p2pk", pk_charlie))
-        assert int(vault("alice", "balance").stdout.strip()) == 5
+        assert int(vault("alice", "balance").stdout.strip()) == 160
         res = vault("alice", "verify", token_charlie)
-        assert "VERIFIED: 2 valid proof(s)" in res.stdout and pk_charlie in res.stdout
+        assert "VERIFIED: 1 valid proof(s)" in res.stdout and pk_charlie in res.stdout
         print("  -> offline verify OK, lock visible inside the secret")
 
         # No claim key / the wrong key: refused. The lock cannot be stripped or relabelled.
@@ -194,10 +236,15 @@ def main():
         relabelled = base64.urlsafe_b64encode(json.dumps(proofs).encode()).decode().rstrip("=")
         r = vault("alice", "settle", relabelled, check=False)
         assert r.returncode != 0 and "SETTLE REJECTED" in r.stdout, r.stdout
-        print("  -> no key / wrong key / relabelled token all REJECTED")
+        # Value inflation: relabel a 2-proof as a 500 keyset => signature check must fail.
+        for p in proofs:
+            p["keyset_id"] = "go-mvp-d500"
+        inflated = base64.urlsafe_b64encode(json.dumps(proofs).encode()).decode().rstrip("=")
+        assert vault("alice", "verify", inflated, check=False).returncode != 0, "denomination relabel accepted"
+        print("  -> no key / wrong key / relabelled / inflated token all REJECTED")
 
         res = vault("alice", "settle", token_charlie, "--claim-key", sk_charlie)
-        assert res.stdout.count("SETTLED OK") == 2, res.stdout
+        assert res.stdout.count("SETTLED OK") == 1, res.stdout
         print("  -> Charlie's claim signature settles it")
 
         step(6, "Double-spend replay rejected; outbox keeps the emitted tokens")
@@ -238,6 +285,7 @@ def main():
 
         rc = http_json("/v1/reconcile")
         assert rc["fully_backed"] and rc["ledger_consistent"], rc
+        assert rc["issued_outstanding"] == 160, rc  # what Alice still holds
         print(f"\nFinal reconcile: {rc}")
         print("\n" + "=" * 65)
         print("  ALL E2E STEPS PASSED")

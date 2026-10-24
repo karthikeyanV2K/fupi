@@ -107,3 +107,15 @@ fupi-vault> WIPE
 - **No lost tokens:** `pay` stores the emitted token in the `outbox` in the same atomic save that removes the proofs.
 
 Known limits: flash is plaintext JSON (no encryption / PIN / secure element yet), no seed restore, 1 proof = 1 unit. See `docs/CODE_PLAN.md`.
+
+## W2: denominations and change
+
+```
+fupi-vault device                      # print this vault's device public key
+fupi-vault allocate <pubkey> <amount>  # OPERATOR (FUPI_CREDIT_SECRET): give the device a quota
+fupi-vault topup 237                   # loads 200+20+10+5+2, each request signed by the device key
+fupi-vault pay 40                      # exact coins, or swaps a larger coin at the ATM first
+fupi-vault recover [--abandon]         # finish (or give up on) an interrupted swap
+```
+
+`balance` is money (sum of denominations). `pin` pins every denomination keyset; a changed key is refused until `pin --force`.

@@ -35,7 +35,7 @@ The bank holds the money. The vault holds *claims* on it. The kiosk's job is to 
 |---|---|---|
 | **W0** | Fix the critical findings from the repo review | **done** (this PR) |
 | **W1** | Deposit-authorised issuance and an append-only ledger | **done** (this PR) |
-| W2 | Denominations (1,2,5,10,20,50,100,200,500), one signing key per denomination, device identity (signed load requests) | todo |
+| **W2** | Denominations (1,2,5,10,20,50,100,200,500), one signing key per denomination, device identity (signed load requests), change-making | **done** |
 | W3 | Merchant terminal: verify-only device, accumulates, settles later | todo |
 | W4 | Cash-out: settlement report first (operator pays by bank app), payout automation later | todo |
 | W5 | Field pilot: 5-10 known people, own funds, tiny cap, written consent, daily reconciliation | todo |
@@ -52,7 +52,7 @@ The bank holds the money. The vault holds *claims* on it. The kiosk's job is to 
 | 6 | `pay` removed proofs before the token was saved anywhere | token written to the `outbox` in the same atomic save | `test_payment_selects_only_matching_lock_and_keeps_outbox` |
 | 7 | Corrupt Go state silently created a new key; no `.bak` | `.bak` + refuse to start on unreadable state; signature released only after state is persisted | `TestCorruptStateNeverRegeneratesKey` |
 | 8 | No server timeouts / body limits; secrets logged in debug | timeouts, 64 KB body cap, debug logging removed | (build + e2e) |
-| 9 | `blind-sign amount=N` counted N units but signed one proof | amount must be 1 | `TestBlindSignAmountMustBeOne` |
+| 9 | `blind-sign amount=N` counted N units but signed one proof | amount must be a supported denomination; face value comes from the keyset | `TestBlindSignRejectsUnsupportedDenominations` |
 | 10 | `bank_rail.py`: default secret, no webhook replay guard, withdrawals counted as top-ups, re-importing a CSV doubled the reserve | no default secret, `ref`-based dedupe, deposits only, `--match` narration filter | `bank_rail.py --mode selftest` |
 
 ### W1: deposit-authorised issuance
@@ -65,12 +65,18 @@ The bank holds the money. The vault holds *claims* on it. The kiosk's job is to 
 
 ## 3. Next: W2 to W5 in code terms
 
-**W2: denominations + device identity**
-* Kiosk: keyset per denomination (`keyset_id = go-mvp-<denom>`), `blind-sign` takes the denomination;
-  `issued` is tracked in money, not proof count. `Proof` gains `amount`.
-* Vault: coin selection (greedy with change via a `/v1/swap` that re-issues blind), balance in money.
-* Device identity: each vault has an ed25519 key; `blind-sign` requests are signed; kiosk keeps a
-  per-device issue quota tied to its deposits.
+### W2: denominations + device identity (done)
+
+| Piece | Design | Test |
+|---|---|---|
+| Keysets | one RSA key per denomination; ids `go-mvp-00` (1, legacy) and `go-mvp-d<N>`; `GET /v1/keysets` | `TestKeysetMapping`, cross_lang [8][9] |
+| Face value | derived from the keyset the signature verifies under, never from a client field; `issued` is money | `TestDenominatedIssueAndSettle` |
+| Device identity | vault holds an ed25519 key; operator allocates quota (`POST /v1/allocate`, HMAC + unique ref, total <= reserve); each request signed over `device|seq|amount|blinded`, seq strictly increasing | `TestDevice*`, e2e step 4 |
+| Anonymous issuance | off unless `-allow-anonymous-issuance` (dev only) | `TestHTTPBlindSignNeedsDevice` |
+| Change-making | `POST /v1/swap`: unlocked proofs in, same-total blind outputs out; idempotent (same request returns the same signatures) | `TestSwap*`, e2e step 4b |
+| Vault | balance in money; exact-subset payment (`NeedChange` if coins do not add up); `pay` swaps automatically; write-ahead `pending_swap` + `recover`/`recover --abandon` | `tests/w2_tests.rs` |
+
+Operator flow: `bank` (credit reserve) -> `allocate <device-pubkey> <amount>` -> vault `topup <amount>`.
 
 **W3: merchant terminal**
 * A verify-only mode (`fupi-vault merchant`): pinned keyset, running total, QR scan input,
@@ -94,7 +100,9 @@ The bank holds the money. The vault holds *claims* on it. The kiosk's job is to 
 | Kiosk scale | full-state rewrite on every sign/settle; one global mutex |
 | Blinding | hash-to-scalar is 256 bits in a 2048-bit modulus (not full-domain-hash); fine for a pilot, review before scale |
 | Offline double-spend | bounded only by the offline cap; first-to-settle-wins |
-| Pico client | plain HTTP only; no locks / claim signatures yet |
+| Pico client | plain HTTP only; no locks, claim signatures, denominations or device key yet |
+| Lost response | if a blind-sign response is lost after the kiosk signed, that proof is lost (quota consumed); swap has write-ahead recovery, top-up does not yet |
+| Swap refusals | the kiosk answers all swap errors with 409, so a refused swap needs an explicit `recover --abandon` after a retry |
 | Reserve | a number in a file; the bank balance is not checked automatically |
 | Legal | none of this is licensed for public use; see the approval paths discussed separately |
 

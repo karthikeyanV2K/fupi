@@ -1,5 +1,6 @@
 pub mod client;
 pub mod crypto;
+pub mod denom;
 pub mod storage;
 pub mod types;
 pub mod vault;

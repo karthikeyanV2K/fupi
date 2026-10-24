@@ -19,6 +19,7 @@ func TestSelfSignedTLSServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	k.CreditReserve(50)
+	k.SetAllowAnonymous(true) // this test exercises TLS, not device auth
 
 	tlsCert, certPEM, _, fp, err := generateSelfSignedCert([]string{"127.0.0.1", "localhost"})
 	if err != nil {

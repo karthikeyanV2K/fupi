@@ -16,13 +16,17 @@ Usage:
   fupi-vault <subcommand> [options]
 
 Subcommands:
-  pin [--force]        Pin the ATM's signing keyset (prints its fingerprint to verify out-of-band)
-  topup <amount>       Withdraw <amount> blind-signed bearer proofs from ATM (--lock <pubkey> to lock them)
-  pay <amount>         Spend <amount> proofs; --p2pk <pubkey> spends proofs locked to that key
+  pin [--force]        Pin the ATM's denomination keysets (prints fingerprints to verify out-of-band)
+  device               Print this vault's device public key (the operator allocates quota to it)
+  allocate <pubkey> <amount>
+                       OPERATOR: give a device an issuance quota (needs FUPI_CREDIT_SECRET; --ref <unique id>)
+  topup <amount>       Withdraw <amount> of value as denominated proofs (--lock <pubkey> to lock them)
+  pay <amount>         Pay exactly <amount>, making change via the ATM if needed; --p2pk <pubkey> spends proofs locked to that key
+  recover [--abandon]  Finish an interrupted change-making swap (--abandon restores its inputs if the ATM refused it)
   outbox               List emitted tokens not yet acknowledged (never lose a token you generated)
   ack <n>              Drop token #n from the outbox once the receiver has it
   receive <token>      Receive/import verified bearer tokens into vault (OFFLINE)
-  balance              Show current active bearer token count
+  balance              Show spendable value (sum of denominations)
   verify <token>       Verify a received token locally (OFFLINE, zero network)
   settle <token>       Settle/redeem a bearer token at the ATM (--claim-key <hex> for locked proofs)
   keygen               Generate an ed25519 claim keypair for P2PK-locked proofs
@@ -57,6 +61,7 @@ struct Config {
     pin_tls: Option<String>,
     reference: Option<String>,
     force: bool,
+    abandon: bool,
     insecure: bool,
 }
 
@@ -81,6 +86,7 @@ fn parse_cli() -> Option<Config> {
     let mut pin_tls = None;
     let mut reference = None;
     let mut force = false;
+    let mut abandon = false;
     let mut insecure = false; // strict TLS unless explicitly relaxed
 
     let mut i = 0;
@@ -107,6 +113,9 @@ fn parse_cli() -> Option<Config> {
         } else if arg == "--ref" && i + 1 < raw_args.len() {
             reference = Some(raw_args[i + 1].clone());
             i += 2;
+        } else if arg == "--abandon" {
+            abandon = true;
+            i += 1;
         } else if arg == "--force" {
             force = true;
             i += 1;
@@ -143,6 +152,7 @@ fn parse_cli() -> Option<Config> {
         pin_tls,
         reference,
         force,
+        abandon,
         insecure,
     })
 }
@@ -208,7 +218,7 @@ fn run_repl(mut vault: Vault, atm_url: String, insecure: bool) {
                     }
                 };
                 match vault.topup(amount) {
-                    Ok(n) => println!("TOPUP SUCCESS: loaded +{n} proofs (balance {})", vault.balance()),
+                    Ok((v, n)) => println!("TOPUP SUCCESS: loaded +{v} in {n} proofs (balance {})", vault.balance()),
                     Err(e) => println!("TOPUP FAILED: {e}"),
                 }
             }
@@ -229,7 +239,7 @@ fn run_repl(mut vault: Vault, atm_url: String, insecure: bool) {
                 } else {
                     None
                 };
-                match vault.make_payment(amount, p2pk) {
+                match vault.pay(amount, p2pk) {
                     Ok(tok) => {
                         println!("\n=== FUPI PAYMENT TOKEN (BEARER TRANSFER) ===");
                         println!("{tok}");
@@ -364,6 +374,12 @@ fn main() {
             println!("FUPI Vault Status");
             println!("  Flash path: {:?}", vault.storage_path());
             println!("  Bearer Balance: {}", vault.balance());
+            for (d, c) in vault.breakdown() {
+                println!("    {c} x {d}");
+            }
+            if vault.has_pending_swap() {
+                println!("  PENDING SWAP: run `recover`");
+            }
             println!("  Journal (last 5 entries):");
             for j in vault.journal().iter().rev().take(5) {
                 println!("    - {j}");
@@ -379,8 +395,8 @@ fn main() {
                 std::process::exit(1);
             });
             match vault.topup_locked(amount, cfg.lock.clone()) {
-                Ok(n) => {
-                    println!("[vault] topup +{n} proofs (balance {})", vault.balance());
+                Ok((v, n)) => {
+                    println!("[vault] topup +{v} in {n} proofs (balance {})", vault.balance());
                 }
                 Err(e) => {
                     eprintln!("Topup failed: {e}");
@@ -397,7 +413,7 @@ fn main() {
                 eprintln!("Invalid payment amount: {}", cfg.args[0]);
                 std::process::exit(1);
             });
-            match vault.make_payment(amount, cfg.p2pk) {
+            match vault.pay(amount, cfg.p2pk) {
                 Ok(token) => {
                     println!("{token}");
                     eprintln!("[vault] token saved in outbox; run `outbox` to re-show it, `ack <n>` once delivered");
@@ -413,11 +429,9 @@ fn main() {
                 eprintln!("Usage: fupi-vault receive <token>");
                 std::process::exit(1);
             }
-            if vault.trusted_keyset().is_none() {
-                if let Some(client) = vault.client() {
-                    if let Ok(ks) = client.get_keyset() {
-                        let _ = vault.cache_keyset(ks);
-                    }
+            if vault.pinned_keysets().is_empty() {
+                if let Ok(list) = vault.fetch_keysets() {
+                    let _ = vault.cache_keysets(&list);
                 }
             }
             let token = &cfg.args[0];
@@ -436,11 +450,9 @@ fn main() {
                 eprintln!("Usage: fupi-vault verify <token>");
                 std::process::exit(1);
             }
-            if vault.trusted_keyset().is_none() {
-                if let Some(client) = vault.client() {
-                    if let Ok(ks) = client.get_keyset() {
-                        let _ = vault.cache_keyset(ks);
-                    }
+            if vault.pinned_keysets().is_empty() {
+                if let Ok(list) = vault.fetch_keysets() {
+                    let _ = vault.cache_keysets(&list);
                 }
             }
             let token = &cfg.args[0];
@@ -516,28 +528,85 @@ fn main() {
             println!("secret_key={sk}   (KEEP PRIVATE: settle --claim-key)");
         }
         "pin" => {
+            let offered = vault.fetch_keysets().unwrap_or_else(|e| {
+                eprintln!("Could not fetch keysets: {e}");
+                std::process::exit(1);
+            });
+            if let Err(e) = Vault::check_keyset_set(&vault.pinned_keysets(), &offered, cfg.force) {
+                if !cfg.force {
+                    eprintln!("Refusing to change pinned keysets: {e}");
+                    std::process::exit(1);
+                }
+            }
+            if let Err(e) = vault.cache_keysets(&offered) {
+                eprintln!("Could not save keysets: {e}");
+                std::process::exit(1);
+            }
+            for k in &offered {
+                let fp = modulus_fingerprint(&k.n).unwrap_or_default();
+                println!("Pinned keyset '{}' (e={}) modulus SHA-256: {fp}", k.keyset_id, k.e);
+            }
+            println!("  Compare these with the values shown by the kiosk operator before trusting them.");
+        }
+        "device" => match vault.device_public_key() {
+            Ok(pk) => println!("device_public_key={pk}"),
+            Err(e) => {
+                eprintln!("device key error: {e}");
+                std::process::exit(1);
+            }
+        },
+        "allocate" => {
+            if cfg.args.len() < 2 {
+                eprintln!("Usage: fupi-vault allocate <device-pubkey-hex> <amount> [--ref <id>]");
+                std::process::exit(1);
+            }
+            let amount: f64 = cfg.args[1].parse().unwrap_or_else(|_| {
+                eprintln!("Invalid amount: {}", cfg.args[1]);
+                std::process::exit(1);
+            });
+            let secret = std::env::var("FUPI_CREDIT_SECRET").unwrap_or_else(|_| {
+                eprintln!("set FUPI_CREDIT_SECRET (same value the kiosk was started with)");
+                std::process::exit(1);
+            });
+            let reference = cfg.reference.clone().unwrap_or_else(|| {
+                let ns = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                format!("alloc-{ns}")
+            });
             let client = vault.client().unwrap_or_else(|| {
                 eprintln!("No ATM client configured");
                 std::process::exit(1);
             });
-            let offered = client.get_keyset().unwrap_or_else(|e| {
-                eprintln!("Could not fetch keyset: {e}");
-                std::process::exit(1);
-            });
-            if !cfg.force {
-                if let Err(e) = Vault::check_keyset_pin(vault.trusted_keyset(), &offered) {
-                    eprintln!("Refusing to change pinned keyset: {e}");
+            match client.allocate(&cfg.args[0], amount, &reference, &secret) {
+                Ok(total) => println!("Device allocation is now {total:.2}"),
+                Err(e) => {
+                    eprintln!("Allocate failed: {e}");
                     std::process::exit(1);
                 }
             }
-            let fp = modulus_fingerprint(&offered.n).unwrap_or_default();
-            if let Err(e) = vault.cache_keyset(offered.clone()) {
-                eprintln!("Could not save keyset: {e}");
-                std::process::exit(1);
+        }
+        "recover" => {
+            if cfg.abandon {
+                match vault.abandon_pending() {
+                    Ok(true) => println!("pending swap abandoned; inputs restored (balance {})", vault.balance()),
+                    Ok(false) => println!("nothing pending"),
+                    Err(e) => {
+                        eprintln!("abandon failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                match vault.recover() {
+                    Ok(true) => println!("pending swap completed (balance {})", vault.balance()),
+                    Ok(false) => println!("nothing pending"),
+                    Err(e) => {
+                        eprintln!("recover failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
             }
-            println!("Pinned keyset '{}' (e={})", offered.keyset_id, offered.e);
-            println!("  modulus SHA-256: {fp}");
-            println!("  Compare this with the value shown by the kiosk operator before trusting it.");
         }
         "outbox" => {
             if vault.outbox().is_empty() {
