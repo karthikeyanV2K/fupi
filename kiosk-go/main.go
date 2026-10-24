@@ -33,6 +33,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -70,14 +72,83 @@ var (
 	ErrDupRef    = errors.New("duplicate deposit reference")
 )
 
+// Denominations the kiosk signs (money units). Denomination 1 keeps the legacy
+// key and keyset id "go-mvp-00" so existing state and tokens keep working.
+var Denominations = []int{1, 2, 5, 10, 20, 50, 100, 200, 500}
+
+const legacyKeysetID = "go-mvp-00"
+
+func isDenomination(a int) bool {
+	for _, d := range Denominations {
+		if d == a {
+			return true
+		}
+	}
+	return false
+}
+
+func keysetIDFor(amount int) string {
+	if amount == 1 {
+		return legacyKeysetID
+	}
+	return fmt.Sprintf("go-mvp-d%d", amount)
+}
+
+// amountForKeyset maps a proof's keyset id to its face value. The value is ALWAYS
+// derived from the keyset the mint signed with, never from a client-supplied field.
+func amountForKeyset(id string) (int, bool) {
+	if id == "" || id == legacyKeysetID {
+		return 1, true
+	}
+	if strings.HasPrefix(id, "go-mvp-d") {
+		if n, err := strconv.Atoi(id[len("go-mvp-d"):]); err == nil && isDenomination(n) {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+type KeysetInfo struct {
+	KeysetID string `json:"keyset_id"`
+	Amount   int    `json:"amount"`
+	N        string `json:"n"`
+	E        int    `json:"e"`
+}
+
+// Device is a vault identified by an ed25519 public key. The operator allocates it a
+// quota (money units); every issuance request must be signed by the device with a
+// strictly increasing sequence number, and cannot exceed the allocation.
+type Device struct {
+	Allocated float64 `json:"allocated"`
+	Loaded    int     `json:"loaded"`
+	LastSeq   uint64  `json:"last_seq"`
+}
+
+var (
+	ErrBadDeviceSig  = errors.New("bad device signature")
+	ErrBadDevice     = errors.New("device must be a 32-byte ed25519 public key in hex")
+	ErrUnknownDevice = errors.New("device has no quota: operator must allocate first")
+	ErrDeviceReplay  = errors.New("stale or replayed device sequence number")
+	ErrQuota         = errors.New("device quota exceeded")
+	ErrOverAllocated = errors.New("allocation exceeds reserve")
+)
+
+const maxSwapCache = 2000
+
 type Kiosk struct {
 	mu           sync.Mutex
-	key          *rsa.PrivateKey
+	key          *rsa.PrivateKey // denomination 1 (legacy keyset go-mvp-00)
+	keys         map[int]*rsa.PrivateKey
 	reserve      float64
-	issued       int
+	issued       int // money units outstanding
 	spent        map[string]struct{}
 	deposits     []Deposit
 	depositRefs  map[string]struct{}
+	devices      map[string]*Device
+	allocRefs    map[string]struct{}
+	swapCache    map[string][]string // idempotency: request hash -> signatures
+	swapOrder    []string
+	allowAnon    bool
 	creditSecret []byte
 	statePath    string
 }
@@ -117,8 +188,12 @@ func hashToScalar(secret []byte, n *big.Int) *big.Int {
 
 func NewKiosk(statePath string) (*Kiosk, error) {
 	k := &Kiosk{
+		keys:        map[int]*rsa.PrivateKey{},
 		spent:       map[string]struct{}{},
 		depositRefs: map[string]struct{}{},
+		devices:     map[string]*Device{},
+		allocRefs:   map[string]struct{}{},
+		swapCache:   map[string][]string{},
 		statePath:   statePath,
 	}
 	loaded, err := k.loadState()
@@ -133,11 +208,48 @@ func NewKiosk(statePath string) (*Kiosk, error) {
 			return nil, err
 		}
 		k.key = key
+		k.keys[1] = key
 		if err := k.saveState(); err != nil {
 			return nil, err
 		}
 	}
 	return k, nil
+}
+
+// EnsureDenominations generates any missing per-denomination signing keys and
+// persists them. NewKiosk only guarantees denomination 1, so tests stay fast.
+func (k *Kiosk) EnsureDenominations() error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	changed := false
+	for _, d := range Denominations {
+		if k.keys[d] != nil {
+			continue
+		}
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		if err != nil {
+			return err
+		}
+		k.keys[d] = key
+		changed = true
+		log.Printf("[kiosk] generated signing key for denomination %d", d)
+	}
+	if changed {
+		return k.saveState()
+	}
+	return nil
+}
+
+func (k *Kiosk) SetAllowAnonymous(v bool) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	k.allowAnon = v
+}
+
+func (k *Kiosk) AnonymousAllowed() bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.allowAnon
 }
 
 // SetCreditSecret configures the HMAC secret that authenticates /v1/credit.
@@ -217,6 +329,8 @@ type Reconcile struct {
 	DepositsTotal    float64 `json:"deposits_total"`
 	DepositCount     int     `json:"deposit_count"`
 	SettledCount     int     `json:"settled_count"`
+	DevicesAllocated float64 `json:"devices_allocated"`
+	DevicesLoaded    int     `json:"devices_loaded"`
 	FullyBacked      bool    `json:"fully_backed"`
 	LedgerConsistent bool    `json:"ledger_consistent"`
 }
@@ -224,9 +338,14 @@ type Reconcile struct {
 func (k *Kiosk) Reconcile() Reconcile {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	var total float64
+	var total, alloc float64
+	var loaded int
 	for _, d := range k.deposits {
 		total += d.Amount
+	}
+	for _, d := range k.devices {
+		alloc += d.Allocated
+		loaded += d.Loaded
 	}
 	return Reconcile{
 		Reserve:          k.reserve,
@@ -234,9 +353,24 @@ func (k *Kiosk) Reconcile() Reconcile {
 		DepositsTotal:    total,
 		DepositCount:     len(k.deposits),
 		SettledCount:     len(k.spent),
+		DevicesAllocated: alloc,
+		DevicesLoaded:    loaded,
 		FullyBacked:      float64(k.issued) <= k.reserve+1e-9,
 		LedgerConsistent: math.Abs(total-k.reserve) < 1e-6,
 	}
+}
+
+// Keysets lists the public key of every denomination the kiosk can sign.
+func (k *Kiosk) Keysets() []KeysetInfo {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	var out []KeysetInfo
+	for _, d := range Denominations {
+		if key := k.keys[d]; key != nil {
+			out = append(out, KeysetInfo{KeysetID: keysetIDFor(d), Amount: d, N: b64(key.N.Bytes()), E: key.E})
+		}
+	}
+	return out
 }
 
 func (k *Kiosk) Pubkey() Keyset {
@@ -254,7 +388,7 @@ func (k *Kiosk) Info(tlsEnabled bool, fingerprint string) AtmInfo {
 	defer k.mu.Unlock()
 	return AtmInfo{
 		Name:           "FUPI Self-Contained Go HTTPS ATM",
-		Version:        "0.2.0",
+		Version:        "0.3.0",
 		KeysetID:       "go-mvp-00",
 		Reserve:        k.reserve,
 		Issued:         k.issued,
@@ -264,18 +398,15 @@ func (k *Kiosk) Info(tlsEnabled bool, fingerprint string) AtmInfo {
 	}
 }
 
-// BlindSign signs a blinded scalar. The kiosk NEVER sees the token secret.
-// Textbook RSA on the blinded value is exactly Chaum's scheme — PKCS#1
-// padding would defeat the blinding, so "raw" here is CORRECT, not lazy.
-// Every proof is worth exactly 1 unit until denominations land (see docs/CODE_PLAN.md),
-// so amount must be 1: one signature is released per unit counted as issued.
-// The signature is only released after the new state is persisted.
-func (k *Kiosk) BlindSign(blindedB64 string, amount int) (string, error) {
-	if amount != 1 {
-		return "", fmt.Errorf("amount must be 1 (one signature per unit)")
+// blindSignNoSave signs a blinded scalar under the key of denomination `amount`
+// and counts `amount` as issued. Caller holds k.mu, then persists or rolls back.
+// The kiosk NEVER sees the token secret. Textbook RSA on the blinded value is
+// exactly Chaum's scheme: PKCS#1 padding would defeat the blinding.
+func (k *Kiosk) blindSignNoSave(blindedB64 string, amount int) (string, error) {
+	key := k.keys[amount]
+	if key == nil {
+		return "", fmt.Errorf("unsupported denomination %d", amount)
 	}
-	k.mu.Lock()
-	defer k.mu.Unlock()
 	if float64(k.issued+amount) > k.reserve {
 		return "", fmt.Errorf("insufficient reserve (1:1 rule)")
 	}
@@ -284,16 +415,127 @@ func (k *Kiosk) BlindSign(blindedB64 string, amount int) (string, error) {
 		return "", fmt.Errorf("invalid base64 blinded_message: %w", err)
 	}
 	mB := new(big.Int).SetBytes(raw)
-	if mB.Sign() <= 0 || mB.Cmp(k.key.N) >= 0 {
+	if mB.Sign() <= 0 || mB.Cmp(key.N) >= 0 {
 		return "", fmt.Errorf("blinded scalar out of valid range [1, N)")
 	}
-	sB := new(big.Int).Exp(mB, k.key.D, k.key.N)
+	sB := new(big.Int).Exp(mB, key.D, key.N)
 	k.issued += amount
+	return b64(sB.Bytes()), nil
+}
+
+// BlindSign is the un-authenticated issuance path (local/dev/tests; over HTTP it is only
+// reachable with -allow-anonymous-issuance). The signature is only released after the
+// new state is persisted.
+func (k *Kiosk) BlindSign(blindedB64 string, amount int) (string, error) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	sig, err := k.blindSignNoSave(blindedB64, amount)
+	if err != nil {
+		return "", err
+	}
 	if err := k.saveState(); err != nil {
 		k.issued -= amount
 		return "", fmt.Errorf("could not persist issuance: %w", err)
 	}
-	return b64(sB.Bytes()), nil
+	return sig, nil
+}
+
+func normDevice(deviceHex string) (string, ed25519.PublicKey, error) {
+	d := strings.ToLower(strings.TrimSpace(deviceHex))
+	b, err := hex.DecodeString(d)
+	if err != nil || len(b) != ed25519.PublicKeySize {
+		return "", nil, ErrBadDevice
+	}
+	return d, ed25519.PublicKey(b), nil
+}
+
+// DeviceSignMessage is exactly what a device signs to request one proof.
+func DeviceSignMessage(device string, seq uint64, amount int, blindedB64 string) string {
+	return fmt.Sprintf("fupi-blind-sign-v1|%s|%d|%d|%s", device, seq, amount, blindedB64)
+}
+
+// AllocateDevice (operator action) gives a device quota. ref must be unique so a replayed
+// allocation request cannot double the quota; total allocations can never exceed the reserve.
+func (k *Kiosk) AllocateDevice(deviceHex string, amount float64, ref string) (float64, error) {
+	dev, _, err := normDevice(deviceHex)
+	if err != nil {
+		return 0, err
+	}
+	if ref == "" || len(ref) > 128 {
+		return 0, ErrBadRef
+	}
+	if !(amount > 0) || math.IsInf(amount, 0) || amount > 1e12 {
+		return 0, ErrBadAmount
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if _, dup := k.allocRefs[ref]; dup {
+		return 0, ErrDupRef
+	}
+	var total float64
+	for _, d := range k.devices {
+		total += d.Allocated
+	}
+	if total+amount > k.reserve+1e-9 {
+		return 0, ErrOverAllocated
+	}
+	d := k.devices[dev]
+	isNew := d == nil
+	if isNew {
+		d = &Device{}
+		k.devices[dev] = d
+	}
+	d.Allocated += amount
+	k.allocRefs[ref] = struct{}{}
+	if err := k.saveState(); err != nil {
+		d.Allocated -= amount
+		if isNew {
+			delete(k.devices, dev)
+		}
+		delete(k.allocRefs, ref)
+		return 0, err
+	}
+	log.Printf("[kiosk] allocated %.2f to device %s.. (total %.2f)", amount, dev[:8], d.Allocated)
+	return d.Allocated, nil
+}
+
+// SignForDevice issues one proof of `amount` to an allocated device. The request must be
+// signed by the device key with a strictly increasing seq, and stay within its quota.
+func (k *Kiosk) SignForDevice(deviceHex string, seq uint64, amount int, blindedB64, sigHex string) (string, error) {
+	dev, pub, err := normDevice(deviceHex)
+	if err != nil {
+		return "", err
+	}
+	sig, derr := hex.DecodeString(strings.TrimSpace(sigHex))
+	if derr != nil || !ed25519.Verify(pub, []byte(DeviceSignMessage(dev, seq, amount, blindedB64)), sig) {
+		return "", ErrBadDeviceSig
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	d := k.devices[dev]
+	if d == nil {
+		return "", ErrUnknownDevice
+	}
+	if seq <= d.LastSeq {
+		return "", ErrDeviceReplay
+	}
+	if amount <= 0 || float64(d.Loaded+amount) > d.Allocated+1e-9 {
+		return "", ErrQuota
+	}
+	out, err := k.blindSignNoSave(blindedB64, amount)
+	if err != nil {
+		return "", err
+	}
+	oldSeq := d.LastSeq
+	d.LastSeq = seq
+	d.Loaded += amount
+	if err := k.saveState(); err != nil {
+		k.issued -= amount
+		d.LastSeq = oldSeq
+		d.Loaded -= amount
+		return "", fmt.Errorf("could not persist issuance: %w", err)
+	}
+	return out, nil
 }
 
 type Proof struct {
@@ -321,33 +563,47 @@ func lockOf(secret string) (pub ed25519.PublicKey, locked bool, err error) {
 	return ed25519.PublicKey(b), true, nil
 }
 
-// Settle redeems a proof. If the secret carries a lock, Claimer must be the
-// hex ed25519 signature over the secret bytes by the locked key. The legacy
-// P2PK field is ignored: it was an unauthenticated label and gave no security.
-func (k *Kiosk) Settle(p Proof) (bool, string) {
+// checkProofLocked verifies a proof against the key of ITS OWN denomination and returns
+// its face value, or a rejection reason. Caller holds k.mu.
+func (k *Kiosk) checkProofLocked(p Proof) (int, string) {
 	if p.Secret == "" {
-		return false, "REJECTED: empty secret"
+		return 0, "REJECTED: empty secret"
 	}
 	if len(p.Secret) > 256 {
-		return false, "REJECTED: secret too long"
+		return 0, "REJECTED: secret too long"
 	}
-	k.mu.Lock()
-	defer k.mu.Unlock()
+	amount, ok := amountForKeyset(p.KeysetID)
+	key := k.keys[amount]
+	if !ok || key == nil {
+		return 0, "REJECTED: unknown keyset"
+	}
 	if _, dup := k.spent[p.Secret]; dup {
-		return false, "REJECTED: double-spend (already settled)"
+		return 0, "REJECTED: double-spend (already settled)"
 	}
 	sigBytes, err := unb64(p.Sig)
 	if err != nil {
-		return false, "REJECTED: invalid signature base64"
+		return 0, "REJECTED: invalid signature base64"
 	}
 	s := new(big.Int).SetBytes(sigBytes)
-	if s.Sign() <= 0 || s.Cmp(k.key.N) >= 0 {
-		return false, "REJECTED: signature scalar out of range"
+	if s.Sign() <= 0 || s.Cmp(key.N) >= 0 {
+		return 0, "REJECTED: signature scalar out of range"
 	}
-	m := hashToScalar([]byte(p.Secret), k.key.N)
-	check := new(big.Int).Exp(s, big.NewInt(int64(k.key.PublicKey.E)), k.key.N)
-	if check.Cmp(m) != 0 {
-		return false, "REJECTED: bad signature"
+	m := hashToScalar([]byte(p.Secret), key.N)
+	if new(big.Int).Exp(s, big.NewInt(int64(key.PublicKey.E)), key.N).Cmp(m) != 0 {
+		return 0, "REJECTED: bad signature"
+	}
+	return amount, ""
+}
+
+// Settle redeems a proof for its face value. If the secret carries a lock, Claimer must be
+// the hex ed25519 signature over the secret bytes by that key. The legacy P2PK field is
+// ignored: it was an unauthenticated label and gave no security.
+func (k *Kiosk) Settle(p Proof) (bool, string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	amount, reason := k.checkProofLocked(p)
+	if reason != "" {
+		return false, reason
 	}
 	lockPub, locked, lerr := lockOf(p.Secret)
 	if lerr != nil {
@@ -360,18 +616,124 @@ func (k *Kiosk) Settle(p Proof) (bool, string) {
 		}
 	}
 	k.spent[p.Secret] = struct{}{}
-	hadIssued := k.issued > 0
-	if hadIssued {
-		k.issued--
+	oldIssued := k.issued
+	k.issued -= amount
+	if k.issued < 0 {
+		k.issued = 0
 	}
 	if err := k.saveState(); err != nil {
 		delete(k.spent, p.Secret)
-		if hadIssued {
-			k.issued++
-		}
+		k.issued = oldIssued
 		return false, "REJECTED: could not persist settlement"
 	}
-	return true, "settled OK (first-to-settle-wins)"
+	return true, fmt.Sprintf("settled OK %d (first-to-settle-wins)", amount)
+}
+
+type SwapOut struct {
+	BlindedMessage string `json:"blinded_message"`
+	Amount         int    `json:"amount"`
+}
+
+func swapKey(inputs []Proof, outputs []SwapOut) string {
+	secrets := make([]string, len(inputs))
+	for i, p := range inputs {
+		secrets[i] = p.Secret
+	}
+	sort.Strings(secrets)
+	h := sha256.New()
+	for _, s := range secrets {
+		h.Write([]byte(s))
+		h.Write([]byte{0})
+	}
+	h.Write([]byte{1})
+	for _, o := range outputs {
+		fmt.Fprintf(h, "%d:%s\x00", o.Amount, o.BlindedMessage)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// Swap exchanges unlocked proofs for fresh blind-signed proofs of the same TOTAL value
+// (change-making: 500 -> 200+200+100, or 50 -> 20+20+10). Issued money is unchanged.
+//
+// It is idempotent: an identical request (same inputs, same blinded outputs) returns the
+// SAME signatures, so a client that crashed after the kiosk spent its inputs can re-send
+// the request and recover its outputs instead of losing the value.
+func (k *Kiosk) Swap(inputs []Proof, outputs []SwapOut) ([]string, error) {
+	if len(inputs) == 0 || len(inputs) > 64 || len(outputs) == 0 || len(outputs) > 64 {
+		return nil, errors.New("swap needs 1-64 inputs and 1-64 outputs")
+	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	ck := swapKey(inputs, outputs)
+	if sigs, ok := k.swapCache[ck]; ok {
+		return append([]string(nil), sigs...), nil
+	}
+
+	seen := map[string]struct{}{}
+	sumIn := 0
+	for _, p := range inputs {
+		if _, dup := seen[p.Secret]; dup {
+			return nil, errors.New("REJECTED: duplicate input in swap")
+		}
+		seen[p.Secret] = struct{}{}
+		amount, reason := k.checkProofLocked(p)
+		if reason != "" {
+			return nil, errors.New(reason)
+		}
+		if _, locked, lerr := lockOf(p.Secret); locked || lerr != nil {
+			return nil, errors.New("REJECTED: locked proofs must be settled by their owner, not swapped")
+		}
+		sumIn += amount
+	}
+	sumOut := 0
+	sigs := make([]string, len(outputs))
+	for i, o := range outputs {
+		key := k.keys[o.Amount]
+		if key == nil {
+			return nil, fmt.Errorf("unsupported output denomination %d", o.Amount)
+		}
+		raw, err := unb64(o.BlindedMessage)
+		if err != nil {
+			return nil, fmt.Errorf("invalid base64 blinded_message: %w", err)
+		}
+		mB := new(big.Int).SetBytes(raw)
+		if mB.Sign() <= 0 || mB.Cmp(key.N) >= 0 {
+			return nil, errors.New("blinded scalar out of valid range [1, N)")
+		}
+		sigs[i] = b64(new(big.Int).Exp(mB, key.D, key.N).Bytes())
+		sumOut += o.Amount
+	}
+	if sumIn != sumOut {
+		return nil, fmt.Errorf("swap not balanced: inputs %d, outputs %d", sumIn, sumOut)
+	}
+
+	for _, p := range inputs {
+		k.spent[p.Secret] = struct{}{}
+	}
+	k.swapCache[ck] = sigs
+	k.swapOrder = append(k.swapOrder, ck)
+	var evicted []string
+	var evictedSigs [][]string
+	for len(k.swapOrder) > maxSwapCache {
+		old := k.swapOrder[0]
+		evicted = append(evicted, old)
+		evictedSigs = append(evictedSigs, k.swapCache[old])
+		k.swapOrder = k.swapOrder[1:]
+		delete(k.swapCache, old)
+	}
+	if err := k.saveState(); err != nil {
+		for _, p := range inputs {
+			delete(k.spent, p.Secret)
+		}
+		delete(k.swapCache, ck)
+		k.swapOrder = k.swapOrder[:len(k.swapOrder)-1]
+		for i, old := range evicted {
+			k.swapCache[old] = evictedSigs[i]
+		}
+		k.swapOrder = append(evicted, k.swapOrder...)
+		return nil, errors.New("could not persist swap")
+	}
+	return append([]string(nil), sigs...), nil
 }
 
 // ---- persistence (survives restarts) ----
@@ -379,13 +741,24 @@ func (k *Kiosk) Settle(p Proof) (bool, string) {
 // Load path: main, then .tmp, then .bak. If any state file exists but none is
 // valid we refuse to start, rather than silently generating a new key.
 
+type diskDenom struct {
+	Amount int    `json:"amount"`
+	N      string `json:"n"`
+	D      string `json:"d"`
+}
+
 type diskState struct {
-	N        string    `json:"n"`
-	D        string    `json:"d"`
-	Reserve  float64   `json:"reserve"`
-	Issued   int       `json:"issued"`
-	Spent    []string  `json:"spent"`
-	Deposits []Deposit `json:"deposits,omitempty"`
+	N         string              `json:"n"` // denomination 1 (legacy keyset)
+	D         string              `json:"d"`
+	Denoms    []diskDenom         `json:"denoms,omitempty"` // every other denomination
+	Reserve   float64             `json:"reserve"`
+	Issued    int                 `json:"issued"`
+	Spent     []string            `json:"spent"`
+	Deposits  []Deposit           `json:"deposits,omitempty"`
+	Devices   map[string]*Device  `json:"devices,omitempty"`
+	AllocRefs []string            `json:"alloc_refs,omitempty"`
+	SwapCache map[string][]string `json:"swap_cache,omitempty"`
+	SwapOrder []string            `json:"swap_order,omitempty"`
 }
 
 func readState(path string) (*diskState, error) {
@@ -408,14 +781,26 @@ func (k *Kiosk) saveState() error {
 		return nil
 	}
 	st := diskState{
-		N:        b64(k.key.N.Bytes()),
-		D:        b64(k.key.D.Bytes()),
-		Reserve:  k.reserve,
-		Issued:   k.issued,
-		Deposits: k.deposits,
+		N:         b64(k.key.N.Bytes()),
+		D:         b64(k.key.D.Bytes()),
+		Reserve:   k.reserve,
+		Issued:    k.issued,
+		Deposits:  k.deposits,
+		Devices:   k.devices,
+		SwapCache: k.swapCache,
+		SwapOrder: k.swapOrder,
+	}
+	for _, d := range Denominations {
+		if d == 1 || k.keys[d] == nil {
+			continue
+		}
+		st.Denoms = append(st.Denoms, diskDenom{Amount: d, N: b64(k.keys[d].N.Bytes()), D: b64(k.keys[d].D.Bytes())})
 	}
 	for s := range k.spent {
 		st.Spent = append(st.Spent, s)
+	}
+	for r := range k.allocRefs {
+		st.AllocRefs = append(st.AllocRefs, r)
 	}
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
@@ -446,23 +831,43 @@ func (k *Kiosk) saveState() error {
 	return os.Rename(tmpPath, k.statePath)
 }
 
-func (k *Kiosk) applyState(st *diskState) error {
-	nBytes, errN := unb64(st.N)
-	dBytes, errD := unb64(st.D)
+// parseKey rebuilds an RSA key from (n, d) and proves it is a working pair: (2^d)^e == 2 (mod n).
+func parseKey(nB64, dB64 string) (*rsa.PrivateKey, error) {
+	nBytes, errN := unb64(nB64)
+	dBytes, errD := unb64(dB64)
 	if errN != nil || errD != nil {
-		return fmt.Errorf("corrupt key encoding")
+		return nil, fmt.Errorf("corrupt key encoding")
 	}
 	n := new(big.Int).SetBytes(nBytes)
 	d := new(big.Int).SetBytes(dBytes)
 	if n.Sign() <= 0 || d.Sign() <= 0 {
-		return fmt.Errorf("invalid key material")
+		return nil, fmt.Errorf("invalid key material")
 	}
-	// Prove (n, d) is a working RSA pair: (2^d)^e == 2 (mod n).
 	two := big.NewInt(2)
 	if new(big.Int).Exp(new(big.Int).Exp(two, d, n), big.NewInt(65537), n).Cmp(two) != 0 {
-		return fmt.Errorf("key pair self-check failed")
+		return nil, fmt.Errorf("key pair self-check failed")
 	}
-	k.key = &rsa.PrivateKey{PublicKey: rsa.PublicKey{N: n, E: 65537}, D: d}
+	return &rsa.PrivateKey{PublicKey: rsa.PublicKey{N: n, E: 65537}, D: d}, nil
+}
+
+func (k *Kiosk) applyState(st *diskState) error {
+	key, err := parseKey(st.N, st.D)
+	if err != nil {
+		return err
+	}
+	keys := map[int]*rsa.PrivateKey{1: key}
+	for _, dd := range st.Denoms {
+		if !isDenomination(dd.Amount) || dd.Amount == 1 {
+			return fmt.Errorf("bad denomination %d in state", dd.Amount)
+		}
+		dk, err := parseKey(dd.N, dd.D)
+		if err != nil {
+			return fmt.Errorf("denomination %d: %w", dd.Amount, err)
+		}
+		keys[dd.Amount] = dk
+	}
+	k.key = key
+	k.keys = keys
 	k.reserve, k.issued = st.Reserve, st.Issued
 	k.spent = map[string]struct{}{}
 	for _, s := range st.Spent {
@@ -480,6 +885,22 @@ func (k *Kiosk) applyState(st *diskState) error {
 		k.deposits = append(k.deposits, Deposit{Ref: "legacy-opening-balance", Amount: gap, At: time.Now().UTC().Format(time.RFC3339)})
 		k.depositRefs["legacy-opening-balance"] = struct{}{}
 	}
+	k.devices = map[string]*Device{}
+	for id, d := range st.Devices {
+		if d != nil {
+			cp := *d
+			k.devices[id] = &cp
+		}
+	}
+	k.allocRefs = map[string]struct{}{}
+	for _, r := range st.AllocRefs {
+		k.allocRefs[r] = struct{}{}
+	}
+	k.swapCache = map[string][]string{}
+	for h, sigs := range st.SwapCache {
+		k.swapCache[h] = append([]string(nil), sigs...)
+	}
+	k.swapOrder = append([]string(nil), st.SwapOrder...)
 	return nil
 }
 
@@ -511,8 +932,8 @@ func (k *Kiosk) loadState() (bool, error) {
 				return false, err
 			}
 		}
-		log.Printf("[kiosk] state loaded: reserve=%.2f issued=%d spent=%d deposits=%d",
-			k.reserve, k.issued, len(k.spent), len(k.deposits))
+		log.Printf("[kiosk] state loaded: reserve=%.2f issued=%d spent=%d deposits=%d denominations=%d devices=%d",
+			k.reserve, k.issued, len(k.spent), len(k.deposits), len(k.keys), len(k.devices))
 		return true, nil
 	}
 	if anyExists {
@@ -681,6 +1102,25 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, v any) bool {
 	return json.NewDecoder(r.Body).Decode(v) == nil
 }
 
+// authedBody reads a size-limited body and checks its HMAC (operator-only endpoints).
+func (k *Kiosk) authedBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	if !k.CreditEnabled() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"error": "operator endpoints disabled: set -credit-secret or FUPI_CREDIT_SECRET"})
+		return nil, false
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<16))
+	if err != nil {
+		writeJSON(w, 400, map[string]string{"error": "bad request"})
+		return nil, false
+	}
+	if !k.VerifyCreditAuth(raw, r.Header.Get("X-Fupi-Signature")) {
+		writeJSON(w, 401, map[string]string{"error": "bad or missing X-Fupi-Signature"})
+		return nil, false
+	}
+	return raw, true
+}
+
 func SetupMux(k *Kiosk, tlsEnabled bool, fingerprint string) *http.ServeMux {
 	mux := http.NewServeMux()
 
@@ -770,24 +1210,106 @@ func SetupMux(k *Kiosk, tlsEnabled bool, fingerprint string) *http.ServeMux {
 		}
 	})
 
+	mux.HandleFunc("/v1/keysets", func(w http.ResponseWriter, r *http.Request) {
+		if getOnly(w, r) {
+			writeJSON(w, 200, map[string]any{"keysets": k.Keysets()})
+		}
+	})
+
+	// POST /v1/allocate  (operator, HMAC-authenticated like /v1/credit)
+	// body {"device":"<ed25519 pubkey hex>","amount":N,"ref":"<unique>"}
+	mux.HandleFunc("/v1/allocate", func(w http.ResponseWriter, r *http.Request) {
+		if !postOnly(w, r) {
+			return
+		}
+		raw, ok := k.authedBody(w, r)
+		if !ok {
+			return
+		}
+		var body struct {
+			Device string  `json:"device"`
+			Amount float64 `json:"amount"`
+			Ref    string  `json:"ref"`
+		}
+		if json.Unmarshal(raw, &body) != nil {
+			writeJSON(w, 400, map[string]string{"error": "bad request"})
+			return
+		}
+		total, err := k.AllocateDevice(body.Device, body.Amount, body.Ref)
+		switch {
+		case errors.Is(err, ErrDupRef):
+			writeJSON(w, 409, map[string]string{"error": err.Error()})
+		case errors.Is(err, ErrOverAllocated):
+			writeJSON(w, 402, map[string]string{"error": err.Error()})
+		case errors.Is(err, ErrBadDevice), errors.Is(err, ErrBadRef), errors.Is(err, ErrBadAmount):
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+		case err != nil:
+			writeJSON(w, 500, map[string]string{"error": "could not persist allocation"})
+		default:
+			writeJSON(w, 200, map[string]float64{"allocated": total})
+		}
+	})
+
 	mux.HandleFunc("/v1/blind-sign", func(w http.ResponseWriter, r *http.Request) {
 		if !postOnly(w, r) {
 			return
 		}
 		var body struct {
 			BlindedMessage string `json:"blinded_message"`
-			Amount         int    `json:"amount"`
+			Amount         int    `json:"amount"` // denomination
+			Device         string `json:"device"`
+			Seq            uint64 `json:"seq"`
+			DeviceSig      string `json:"device_sig"`
 		}
 		if !decodeJSON(w, r, &body) || body.Amount <= 0 {
 			writeJSON(w, 400, map[string]string{"error": "bad request"})
 			return
 		}
-		sig, err := k.BlindSign(body.BlindedMessage, body.Amount)
-		if err != nil {
+		var sig string
+		var err error
+		if body.Device == "" {
+			if !k.AnonymousAllowed() {
+				writeJSON(w, 401, map[string]string{"error": "device signature required"})
+				return
+			}
+			sig, err = k.BlindSign(body.BlindedMessage, body.Amount)
+		} else {
+			sig, err = k.SignForDevice(body.Device, body.Seq, body.Amount, body.BlindedMessage, body.DeviceSig)
+		}
+		switch {
+		case err == nil:
+			writeJSON(w, 200, map[string]string{"blind_signature": sig})
+		case errors.Is(err, ErrBadDeviceSig), errors.Is(err, ErrBadDevice):
+			writeJSON(w, 401, map[string]string{"error": err.Error()})
+		case errors.Is(err, ErrUnknownDevice):
+			writeJSON(w, 403, map[string]string{"error": err.Error()})
+		case errors.Is(err, ErrDeviceReplay):
+			writeJSON(w, 409, map[string]string{"error": err.Error()})
+		default: // quota, reserve, bad scalar, unsupported denomination
 			writeJSON(w, 402, map[string]string{"error": err.Error()})
+		}
+	})
+
+	// POST /v1/swap  {"inputs":[Proof...],"outputs":[{"blinded_message","amount"}...]}
+	// -> {"signatures":[...]} in output order. Idempotent for an identical request.
+	mux.HandleFunc("/v1/swap", func(w http.ResponseWriter, r *http.Request) {
+		if !postOnly(w, r) {
 			return
 		}
-		writeJSON(w, 200, map[string]string{"blind_signature": sig})
+		var body struct {
+			Inputs  []Proof   `json:"inputs"`
+			Outputs []SwapOut `json:"outputs"`
+		}
+		if !decodeJSON(w, r, &body) {
+			writeJSON(w, 400, map[string]string{"error": "bad request"})
+			return
+		}
+		sigs, err := k.Swap(body.Inputs, body.Outputs)
+		if err != nil {
+			writeJSON(w, 409, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, 200, map[string]any{"signatures": sigs})
 	})
 
 	mux.HandleFunc("/v1/settle", func(w http.ResponseWriter, r *http.Request) {
@@ -839,11 +1361,20 @@ func main() {
 	forceNewCert := flag.Bool("force-new-cert", false, "force new TLS cert generation even if kiosk_cert.pem exists")
 	creditSecret := flag.String("credit-secret", os.Getenv("FUPI_CREDIT_SECRET"),
 		"HMAC secret authenticating POST /v1/credit (prefer env FUPI_CREDIT_SECRET). Empty = credit endpoint disabled")
+	anon := flag.Bool("allow-anonymous-issuance", false,
+		"DEV ONLY: accept /v1/blind-sign without a device signature (no per-device quota)")
 	flag.Parse()
 
 	k, err := NewKiosk(*statePath)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if err := k.EnsureDenominations(); err != nil {
+		log.Fatalf("could not prepare denomination keys: %v", err)
+	}
+	k.SetAllowAnonymous(*anon)
+	if *anon {
+		log.Printf("[kiosk-go] WARNING: anonymous issuance enabled (development only)")
 	}
 	k.SetCreditSecret(*creditSecret)
 	if !k.CreditEnabled() {

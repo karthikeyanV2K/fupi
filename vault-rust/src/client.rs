@@ -1,6 +1,7 @@
 use crate::types::{
-    AtmInfo, BlindSignRequest, BlindSignResponse, CreditRequest, CreditResponse, Keyset, Proof,
-    SettleResponse,
+    AllocateRequest, AllocateResponse, AtmInfo, BlindSignRequest, BlindSignResponse,
+    CreditRequest, CreditResponse, Keyset, KeysetsResponse, Proof, SettleResponse, SwapOut,
+    SwapRequest, SwapResponse,
 };
 use std::fmt;
 use std::sync::Arc;
@@ -213,44 +214,116 @@ impl AtmClient {
             .map_err(|e| ClientError::Serialization(e.to_string()))
     }
 
+    fn post_json(&self, path: &str, body: &str, signature: Option<&str>) -> Result<String, ClientError> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.agent.post(&url).set("Content-Type", "application/json");
+        if let Some(sig) = signature {
+            req = req.set("X-Fupi-Signature", sig);
+        }
+        match req.send_string(body) {
+            Ok(r) => r
+                .into_string()
+                .map_err(|e| ClientError::Transport(e.to_string())),
+            Err(ureq::Error::Status(code, resp)) => {
+                Err(ClientError::HttpStatus(code, resp.into_string().unwrap_or_default()))
+            }
+            Err(e) => Err(ClientError::Transport(e.to_string())),
+        }
+    }
+
+    fn hmac_hex(secret: &str, body: &str) -> Result<String, ClientError> {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+            .map_err(|e| ClientError::Serialization(e.to_string()))?;
+        mac.update(body.as_bytes());
+        Ok(crate::crypto::hex_encode(&mac.finalize().into_bytes()))
+    }
+
     /// Operator action: credit the kiosk reserve for a verified inbound payment.
     /// The request body is authenticated with HMAC-SHA256(secret, body) and `reference`
     /// must be unique (a replay is rejected with HTTP 409).
     pub fn credit_reserve(&self, amount: f64, reference: &str, secret: &str) -> Result<f64, ClientError> {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-
-        let url = format!("{}/v1/credit", self.base_url);
-        let payload = CreditRequest {
+        let body = serde_json::to_string(&CreditRequest {
             amount,
             reference: reference.to_string(),
-        };
-        let req_json = serde_json::to_string(&payload)
-            .map_err(|e| ClientError::Serialization(e.to_string()))?;
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-            .map_err(|e| ClientError::Serialization(e.to_string()))?;
-        mac.update(req_json.as_bytes());
-        let sig = crate::crypto::hex_encode(&mac.finalize().into_bytes());
-
-        let resp = match self
-            .agent
-            .post(&url)
-            .set("Content-Type", "application/json")
-            .set("X-Fupi-Signature", &sig)
-            .send_string(&req_json)
-        {
-            Ok(r) => r,
-            Err(ureq::Error::Status(code, resp)) => {
-                return Err(ClientError::HttpStatus(code, resp.into_string().unwrap_or_default()));
-            }
-            Err(e) => return Err(ClientError::Transport(e.to_string())),
-        };
-        let resp_str = resp
-            .into_string()
-            .map_err(|e| ClientError::Transport(e.to_string()))?;
-        let res: CreditResponse = serde_json::from_str(&resp_str)
+        })
+        .map_err(|e| ClientError::Serialization(e.to_string()))?;
+        let sig = Self::hmac_hex(secret, &body)?;
+        let resp = self.post_json("/v1/credit", &body, Some(&sig))?;
+        let res: CreditResponse = serde_json::from_str(&resp)
             .map_err(|e| ClientError::Serialization(e.to_string()))?;
         Ok(res.reserve)
+    }
+
+    /// Operator action: give a device (ed25519 public key hex) issuance quota.
+    pub fn allocate(&self, device: &str, amount: f64, reference: &str, secret: &str) -> Result<f64, ClientError> {
+        let body = serde_json::to_string(&AllocateRequest {
+            device: device.to_string(),
+            amount,
+            reference: reference.to_string(),
+        })
+        .map_err(|e| ClientError::Serialization(e.to_string()))?;
+        let sig = Self::hmac_hex(secret, &body)?;
+        let resp = self.post_json("/v1/allocate", &body, Some(&sig))?;
+        let res: AllocateResponse = serde_json::from_str(&resp)
+            .map_err(|e| ClientError::Serialization(e.to_string()))?;
+        Ok(res.allocated)
+    }
+
+    /// Public keys of every denomination the kiosk signs.
+    pub fn get_keysets(&self) -> Result<Vec<Keyset>, ClientError> {
+        let url = format!("{}/v1/keysets", self.base_url);
+        let resp = self
+            .agent
+            .get(&url)
+            .call()
+            .map_err(|e| ClientError::Transport(e.to_string()))?
+            .into_string()
+            .map_err(|e| ClientError::Transport(e.to_string()))?;
+        let r: KeysetsResponse = serde_json::from_str(&resp)
+            .map_err(|e| ClientError::Serialization(e.to_string()))?;
+        Ok(r.keysets)
+    }
+
+    /// Ask for one proof of `denomination`, authenticated by this device's signature.
+    pub fn blind_sign_device(
+        &self,
+        blinded_b64: &str,
+        denomination: u32,
+        device: &str,
+        seq: u64,
+        device_sig: &str,
+    ) -> Result<String, ClientError> {
+        let body = serde_json::to_string(&BlindSignRequest {
+            blinded_message: blinded_b64.to_string(),
+            amount: denomination,
+            device: Some(device.to_string()),
+            seq: Some(seq),
+            device_sig: Some(device_sig.to_string()),
+        })
+        .map_err(|e| ClientError::Serialization(e.to_string()))?;
+        let resp = self.post_json("/v1/blind-sign", &body, None)?;
+        let r: BlindSignResponse = serde_json::from_str(&resp)
+            .map_err(|e| ClientError::Serialization(e.to_string()))?;
+        Ok(r.blind_signature)
+    }
+
+    /// Exchange proofs for fresh blind-signed ones of equal total value. Idempotent on the
+    /// kiosk: re-sending the identical request returns the same signatures.
+    pub fn swap(&self, inputs: &[Proof], outputs: &[(String, u64)]) -> Result<Vec<String>, ClientError> {
+        let body = serde_json::to_string(&SwapRequest {
+            inputs,
+            outputs: outputs
+                .iter()
+                .map(|(b, a)| SwapOut { blinded_message: b.clone(), amount: *a })
+                .collect(),
+        })
+        .map_err(|e| ClientError::Serialization(e.to_string()))?;
+        let resp = self.post_json("/v1/swap", &body, None)?;
+        let r: SwapResponse = serde_json::from_str(&resp)
+            .map_err(|e| ClientError::Serialization(e.to_string()))?;
+        Ok(r.signatures)
     }
 
     pub fn blind_sign(&self, blinded_b64: &str, amount: u32) -> Result<String, ClientError> {
@@ -258,6 +331,9 @@ impl AtmClient {
         let payload = BlindSignRequest {
             blinded_message: blinded_b64.to_string(),
             amount,
+            device: None,
+            seq: None,
+            device_sig: None,
         };
         let req_json = serde_json::to_string(&payload)
             .map_err(|e| ClientError::Serialization(e.to_string()))?;
