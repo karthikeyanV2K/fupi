@@ -16,6 +16,8 @@ Covers the hardened flow:
    6. Offline verify, replay (double-spend) rejection, token outbox
    7. Peer-to-peer offline receive, forged tokens (e=1, fake modulus) rejected
    8. 5-way concurrent settle race: exactly one winner
+   9. Merchant terminal: offline accept with invoice/amount checks, replay refused, batch settle,
+      a customer who double-spends is caught at settlement and shown on the receipt
 """
 
 import base64
@@ -40,6 +42,7 @@ TEST_STATE = os.path.join(ROOT_DIR, "test_atm_state_e2e.json")
 FLASH = {
     "alice": os.path.join(ROOT_DIR, "test_vault_flash_alice_e2e.json"),
     "bob": os.path.join(ROOT_DIR, "test_vault_flash_bob_e2e.json"),
+    "shop": os.path.join(ROOT_DIR, "test_vault_flash_shop_e2e.json"),
 }
 CREDIT_SECRET = "e2e-credit-secret-not-for-production"
 
@@ -283,9 +286,34 @@ def main():
         assert ok == 1, f"expected exactly 1 winner, got {ok}"
         print("  -> exactly 1 winner, 4 rejected")
 
+        step(10, "Merchant terminal: accept offline, refuse replays, batch settle, catch a double-spend")
+        assert "Pinned keyset" in vault("shop", "pin").stdout
+        t37 = last_line(vault("alice", "pay", "37"))
+        res = vault("shop", "accept", t37, "--invoice", "INV-1", "--expect", "37")
+        assert "ACCEPTED receipt #1 amount=37" in res.stdout, res.stdout
+        for extra in (["--expect", "37"], []):  # replay of the same token
+            r = vault("shop", "accept", t37, *extra, check=False)
+            assert r.returncode == 2 and "REJECTED" in r.stdout, r.stdout
+        t20 = last_line(vault("alice", "pay", "20"))
+        r = vault("shop", "accept", t20, "--expect", "25", check=False)  # wrong amount: nothing stored
+        assert r.returncode == 2 and "Wrong amount" in r.stdout, r.stdout
+        assert int(vault("shop", "balance").stdout.strip()) == 37
+        assert "ACCEPTED receipt #2 amount=20" in vault("shop", "accept", t20, "--invoice", "INV-2").stdout
+        t10 = last_line(vault("alice", "pay", "10"))
+        assert "ACCEPTED receipt #3 amount=10" in vault("shop", "accept", t10, "--invoice", "INV-3").stdout
+        # Alice settles the 20 herself before the shop does (offline double-spend).
+        assert vault("alice", "settle", t20).stdout.count("SETTLED OK") >= 1
+        r = vault("shop", "settle-all", check=False)
+        assert r.returncode == 2 and "SETTLED value=47 rejected=20 still_held=0" in r.stdout, r.stdout
+        rcpts = vault("shop", "receipts").stdout
+        assert "invoice=INV-1 amount=37 settled=37 rejected=0 pending=0" in rcpts, rcpts
+        assert "invoice=INV-2 amount=20 settled=0 rejected=20 pending=0" in rcpts, rcpts
+        assert "invoice=INV-3 amount=10 settled=10 rejected=0 pending=0" in rcpts, rcpts
+        print("  -> 47 settled to the merchant; the double-spent 20 shows as rejected on its receipt")
+
         rc = http_json("/v1/reconcile")
         assert rc["fully_backed"] and rc["ledger_consistent"], rc
-        assert rc["issued_outstanding"] == 160, rc  # what Alice still holds
+        assert rc["issued_outstanding"] == int(vault("alice", "balance").stdout.strip()), rc
         print(f"\nFinal reconcile: {rc}")
         print("\n" + "=" * 65)
         print("  ALL E2E STEPS PASSED")

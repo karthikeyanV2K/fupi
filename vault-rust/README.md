@@ -119,3 +119,12 @@ fupi-vault recover [--abandon]         # finish (or give up on) an interrupted s
 ```
 
 `balance` is money (sum of denominations). `pin` pins every denomination keyset; a changed key is refused until `pin --force`.
+
+## W3: merchant terminal
+
+```
+fupi-vault pin                                   # merchant pins the kiosk keysets once
+fupi-vault accept <token> --invoice INV-1 --expect 37   # offline; refuses replays / wrong amount / forgeries
+fupi-vault receipts                              # audit log with settlement status
+fupi-vault settle-all                            # when online; exit 2 if any proof was rejected
+```

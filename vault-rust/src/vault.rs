@@ -7,7 +7,7 @@ use crate::crypto::{
 };
 use crate::denom::{denomination_of, exact_subset, keyset_id_for, proof_value, split_amount, MAX_EXACT_TARGET};
 use crate::storage::{FlashStorage, StorageError};
-use crate::types::{FlashState, Keyset, PendingOut, PendingSwap, Proof};
+use crate::types::{FlashState, Keyset, PendingOut, PendingSwap, Proof, Receipt};
 use num_bigint::BigUint;
 use std::fmt;
 
@@ -26,6 +26,10 @@ pub enum VaultError {
     UnsupportedAmount(String),
     /// A change-making swap was started and not finished. Run `recover`.
     SwapPending(String),
+    /// Merchant: the payment is not what the invoice asked for.
+    WrongAmount { expected: u64, got: u64 },
+    /// Merchant: this token (or part of it) was already accepted.
+    DuplicateToken,
 }
 
 impl fmt::Display for VaultError {
@@ -47,6 +51,10 @@ impl fmt::Display for VaultError {
                 f,
                 "Cannot pay exactly {requested}: holding {have} but not in coins that add up (change needed)"
             ),
+            VaultError::WrongAmount { expected, got } => {
+                write!(f, "Wrong amount: invoice expects {expected}, token is worth {got}")
+            }
+            VaultError::DuplicateToken => write!(f, "Token already accepted (replay at the counter)"),
             VaultError::UnsupportedAmount(m) => write!(f, "Unsupported amount: {m}"),
             VaultError::SwapPending(m) => write!(
                 f,
@@ -766,6 +774,106 @@ impl Vault {
         }
 
         Ok(results)
+    }
+
+    // ---------------------------------------------------------------- merchant terminal
+
+    fn token_value(proofs: &[Proof]) -> u64 {
+        proofs.iter().map(proof_value).sum()
+    }
+
+    /// Merchant side of a payment: verify OFFLINE against the pinned keysets, refuse replays
+    /// and wrong amounts, store the proofs and write a receipt, all in one atomic save.
+    /// Nothing is stored unless the whole token passes. The proofs are only as good as the
+    /// first settlement: until `settle_all` runs, an offline double-spend is still possible.
+    pub fn accept_payment(
+        &mut self,
+        token_str: &str,
+        invoice: Option<String>,
+        expect: Option<u64>,
+    ) -> Result<Receipt, VaultError> {
+        let proofs = Self::verify_offline_set(token_str, &self.pinned_keysets())?;
+        let value = Self::token_value(&proofs);
+        if let Some(want) = expect {
+            if want != value {
+                return Err(VaultError::WrongAmount { expected: want, got: value });
+            }
+        }
+        let known = |sec: &str| {
+            self.state.proofs.iter().any(|p| p.secret == sec)
+                || self.state.receipts.iter().any(|r| r.secrets.iter().any(|x| x == sec))
+        };
+        let mut seen = std::collections::HashSet::new();
+        if proofs.iter().any(|p| known(&p.secret) || !seen.insert(p.secret.clone())) {
+            return Err(VaultError::DuplicateToken);
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let receipt = Receipt {
+            id: self.state.receipts.last().map(|r| r.id).unwrap_or(0) + 1,
+            invoice,
+            amount: value,
+            secrets: proofs.iter().map(|p| p.secret.clone()).collect(),
+            ts,
+            settled: 0,
+            rejected: 0,
+        };
+        let mut next = self.state.clone();
+        next.proofs.extend(proofs);
+        next.receipts.push(receipt.clone());
+        next.journal.push(format!("accepted #{} {} (held {})", receipt.id, value, Self::token_value(&next.proofs)));
+        self.storage.save(&next)?;
+        self.state = next;
+        Ok(receipt)
+    }
+
+    pub fn receipts(&self) -> &[Receipt] {
+        &self.state.receipts
+    }
+
+    /// Settle every held proof at the ATM, one at a time, saving after each answer.
+    /// Accepted proofs leave the vault (the ATM now owes the merchant); a proof the ATM
+    /// rejects (already spent elsewhere, bad lock) is dropped from the held balance and
+    /// counted as `rejected` on its receipt, so the shortfall is visible, not silent.
+    /// A transport error stops the run and keeps everything not yet answered.
+    /// Returns (settled value, rejected value, value still held).
+    pub fn settle_all(&mut self, claim_key: Option<String>) -> Result<(u64, u64, u64), VaultError> {
+        let client = self.client.as_ref().ok_or(VaultError::NoClientConfigured)?;
+        let (mut ok_v, mut bad_v) = (0u64, 0u64);
+        let mut stop: Option<VaultError> = None;
+        for proof in self.state.proofs.clone() {
+            let mut p = proof.clone();
+            p.p2pk = None;
+            if let (Some(key), Some(_)) = (claim_key.as_deref(), lock_of(&p.secret)?) {
+                p.claimer = Some(claim_signature(key, &p.secret)?);
+            }
+            let (ok, msg) = match client.settle(&p) {
+                Ok(r) => r,
+                Err(ClientError::HttpStatus(code, _)) if code != 409 && code < 500 => {
+                    (false, format!("refused: HTTP {code}"))
+                }
+                Err(e) => {
+                    stop = Some(VaultError::Client(e));
+                    break;
+                }
+            };
+            let v = proof_value(&proof);
+            let mut next = self.state.clone();
+            next.proofs.retain(|x| x.secret != proof.secret);
+            for r in next.receipts.iter_mut().filter(|r| r.secrets.contains(&proof.secret)) {
+                if ok { r.settled += v } else { r.rejected += v }
+            }
+            next.journal.push(format!("settle {} {} ({msg})", if ok { "OK" } else { "REJECTED" }, v));
+            self.storage.save(&next)?;
+            self.state = next;
+            if ok { ok_v += v } else { bad_v += v }
+        }
+        match stop {
+            Some(e) => Err(e),
+            None => Ok((ok_v, bad_v, self.balance() as u64)),
+        }
     }
 
     /// Complete vault wipe (e.g. tamper detection / duress).

@@ -67,6 +67,23 @@ pub struct FlashState {
     /// same signatures (the swap is idempotent).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_swap: Option<PendingSwap>,
+    /// Merchant mode: one receipt per accepted payment (kept after settlement as the audit log).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub receipts: Vec<Receipt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Receipt {
+    /// 1-based, stable, never reused.
+    pub id: u64,
+    pub invoice: Option<String>,
+    pub amount: u64,
+    /// Secrets of the proofs this payment brought (settlement status is tracked per secret).
+    pub secrets: Vec<String>,
+    /// Unix seconds when accepted (0 if the device has no clock).
+    pub ts: u64,
+    pub settled: u64,
+    pub rejected: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

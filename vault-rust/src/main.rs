@@ -22,6 +22,9 @@ Subcommands:
                        OPERATOR: give a device an issuance quota (needs FUPI_CREDIT_SECRET; --ref <unique id>)
   topup <amount>       Withdraw <amount> of value as denominated proofs (--lock <pubkey> to lock them)
   pay <amount>         Pay exactly <amount>, making change via the ATM if needed; --p2pk <pubkey> spends proofs locked to that key
+  accept <token>       MERCHANT: verify offline, store, write a receipt (--invoice <id>, --expect <amount>)
+  receipts             MERCHANT: list accepted payments and their settlement status
+  settle-all           MERCHANT: settle every held proof at the ATM when online (--claim-key for locked proofs)
   recover [--abandon]  Finish an interrupted change-making swap (--abandon restores its inputs if the ATM refused it)
   outbox               List emitted tokens not yet acknowledged (never lose a token you generated)
   ack <n>              Drop token #n from the outbox once the receiver has it
@@ -44,7 +47,7 @@ Flags:
   --p2pk <pubkey>      (pay) spend proofs locked to this ed25519 public key (hex)
   --lock <pubkey>      (topup) lock new proofs to this ed25519 public key (hex)
   --claim-key <hex>    (settle) ed25519 secret key that signs claims for locked proofs
-  --ref <id>           (bank) unique payment reference; replays are rejected
+  --invoice <id>       (accept) invoice / order id to record on the receipt\n  --expect <amount>    (accept) refuse the token unless it is worth exactly this\n  --ref <id>           (bank) unique payment reference; replays are rejected
   --force              (pin) replace an already pinned keyset
 "#
     );
@@ -62,6 +65,8 @@ struct Config {
     reference: Option<String>,
     force: bool,
     abandon: bool,
+    invoice: Option<String>,
+    expect: Option<u64>,
     insecure: bool,
 }
 
@@ -87,6 +92,8 @@ fn parse_cli() -> Option<Config> {
     let mut reference = None;
     let mut force = false;
     let mut abandon = false;
+    let mut invoice = None;
+    let mut expect = None;
     let mut insecure = false; // strict TLS unless explicitly relaxed
 
     let mut i = 0;
@@ -112,6 +119,16 @@ fn parse_cli() -> Option<Config> {
             i += 2;
         } else if arg == "--ref" && i + 1 < raw_args.len() {
             reference = Some(raw_args[i + 1].clone());
+            i += 2;
+        } else if arg == "--invoice" && i + 1 < raw_args.len() {
+            invoice = Some(raw_args[i + 1].clone());
+            i += 2;
+        } else if arg == "--expect" && i + 1 < raw_args.len() {
+            expect = raw_args[i + 1].parse().ok();
+            if expect.is_none() {
+                eprintln!("--expect needs a whole number");
+                return None;
+            }
             i += 2;
         } else if arg == "--abandon" {
             abandon = true;
@@ -153,6 +170,8 @@ fn parse_cli() -> Option<Config> {
         reference,
         force,
         abandon,
+        invoice,
+        expect,
         insecure,
     })
 }
@@ -587,6 +606,50 @@ fn main() {
                 }
             }
         }
+        "accept" => {
+            let token = cfg.args.first().unwrap_or_else(|| {
+                eprintln!("Usage: fupi-vault accept <token> [--invoice <id>] [--expect <amount>]");
+                std::process::exit(1);
+            });
+            if vault.pinned_keysets().is_empty() {
+                eprintln!("No pinned keysets: run `pin` first (a merchant must never trust keys from a token)");
+                std::process::exit(1);
+            }
+            match vault.accept_payment(token, cfg.invoice.clone(), cfg.expect) {
+                Ok(r) => println!(
+                    "ACCEPTED receipt #{} amount={} proofs={} held_total={}",
+                    r.id, r.amount, r.secrets.len(), vault.balance()
+                ),
+                Err(e) => {
+                    println!("REJECTED: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        "receipts" => {
+            if vault.receipts().is_empty() {
+                println!("(no receipts)");
+            }
+            for r in vault.receipts() {
+                println!(
+                    "#{} ts={} invoice={} amount={} settled={} rejected={} pending={}",
+                    r.id, r.ts, r.invoice.as_deref().unwrap_or("-"), r.amount, r.settled, r.rejected,
+                    r.amount - r.settled - r.rejected
+                );
+            }
+        }
+        "settle-all" => match vault.settle_all(cfg.claim_key.clone()) {
+            Ok((ok, bad, held)) => {
+                println!("SETTLED value={ok} rejected={bad} still_held={held}");
+                if bad > 0 {
+                    std::process::exit(2);
+                }
+            }
+            Err(e) => {
+                eprintln!("settle-all stopped: {e} (unanswered proofs are still held)");
+                std::process::exit(1);
+            }
+        },
         "recover" => {
             if cfg.abandon {
                 match vault.abandon_pending() {

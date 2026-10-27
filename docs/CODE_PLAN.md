@@ -36,7 +36,7 @@ The bank holds the money. The vault holds *claims* on it. The kiosk's job is to 
 | **W0** | Fix the critical findings from the repo review | **done** (this PR) |
 | **W1** | Deposit-authorised issuance and an append-only ledger | **done** (this PR) |
 | **W2** | Denominations (1,2,5,10,20,50,100,200,500), one signing key per denomination, device identity (signed load requests), change-making | **done** |
-| W3 | Merchant terminal: verify-only device, accumulates, settles later | todo |
+| **W3** | Merchant terminal: verify-only device, accumulates, settles later | **done** |
 | W4 | Cash-out: settlement report first (operator pays by bank app), payout automation later | todo |
 | W5 | Field pilot: 5-10 known people, own funds, tiny cap, written consent, daily reconciliation | todo |
 
@@ -78,9 +78,17 @@ The bank holds the money. The vault holds *claims* on it. The kiosk's job is to 
 
 Operator flow: `bank` (credit reserve) -> `allocate <device-pubkey> <amount>` -> vault `topup <amount>`.
 
-**W3: merchant terminal**
-* A verify-only mode (`fupi-vault merchant`): pinned keyset, running total, QR scan input,
-  batched `settle` when online, local receipt log.
+### W3: merchant terminal (done)
+
+| Command | Behaviour |
+|---|---|
+| `accept <token> [--invoice ID] [--expect N]` | verify OFFLINE against pinned keysets only; refuse wrong amount, replays, duplicate secrets, unpinned/forged keys; nothing is stored unless the whole token passes; receipt written in the same atomic save |
+| `receipts` | audit log: id, time, invoice, amount, settled, rejected, pending |
+| `settle-all [--claim-key]` | settles held proofs one by one, saving after each answer; a rejected proof (customer double-spent) is dropped from the held total and shown as `rejected` on its receipt; a network error stops the run and keeps unanswered proofs |
+
+Risk the terminal cannot remove: until `settle-all` succeeds, an offline token is only as good as
+first-to-settle-wins. Mitigations are the offline cap per device and settling often.
+Tests: `vault-rust/tests/w3_tests.rs`, e2e step 10.
 
 **W4: cash-out**
 * `GET /v1/settlements?since=` report (merchant, amount, time, proof count) for the operator.
