@@ -25,6 +25,9 @@ Subcommands:
   accept <token>       MERCHANT: verify offline, store, write a receipt (--invoice <id>, --expect <amount>)
   receipts             MERCHANT: list accepted payments and their settlement status
   settle-all           MERCHANT: settle every held proof at the ATM when online (--claim-key for locked proofs)
+  report               OPERATOR: settlement log + what each merchant is owed (--since <seq>, --merchant <label>)
+  payout <merchant> <amount>
+                       OPERATOR: record a bank payout to a merchant (--ref <bank UTR>, unique)
   recover [--abandon]  Finish an interrupted change-making swap (--abandon restores its inputs if the ATM refused it)
   outbox               List emitted tokens not yet acknowledged (never lose a token you generated)
   ack <n>              Drop token #n from the outbox once the receiver has it
@@ -47,7 +50,7 @@ Flags:
   --p2pk <pubkey>      (pay) spend proofs locked to this ed25519 public key (hex)
   --lock <pubkey>      (topup) lock new proofs to this ed25519 public key (hex)
   --claim-key <hex>    (settle) ed25519 secret key that signs claims for locked proofs
-  --invoice <id>       (accept) invoice / order id to record on the receipt\n  --expect <amount>    (accept) refuse the token unless it is worth exactly this\n  --ref <id>           (bank) unique payment reference; replays are rejected
+  --merchant <label>   (settle, settle-all) payee label recorded on the kiosk settlement log\n  --since <seq>        (report) only entries after this sequence number\n  --invoice <id>       (accept) invoice / order id to record on the receipt\n  --expect <amount>    (accept) refuse the token unless it is worth exactly this\n  --ref <id>           (bank) unique payment reference; replays are rejected
   --force              (pin) replace an already pinned keyset
 "#
     );
@@ -66,6 +69,8 @@ struct Config {
     force: bool,
     abandon: bool,
     invoice: Option<String>,
+    merchant: Option<String>,
+    since: u64,
     expect: Option<u64>,
     insecure: bool,
 }
@@ -93,6 +98,8 @@ fn parse_cli() -> Option<Config> {
     let mut force = false;
     let mut abandon = false;
     let mut invoice = None;
+    let mut merchant = None;
+    let mut since = 0u64;
     let mut expect = None;
     let mut insecure = false; // strict TLS unless explicitly relaxed
 
@@ -122,6 +129,12 @@ fn parse_cli() -> Option<Config> {
             i += 2;
         } else if arg == "--invoice" && i + 1 < raw_args.len() {
             invoice = Some(raw_args[i + 1].clone());
+            i += 2;
+        } else if arg == "--merchant" && i + 1 < raw_args.len() {
+            merchant = Some(raw_args[i + 1].clone());
+            i += 2;
+        } else if arg == "--since" && i + 1 < raw_args.len() {
+            since = raw_args[i + 1].parse().unwrap_or(0);
             i += 2;
         } else if arg == "--expect" && i + 1 < raw_args.len() {
             expect = raw_args[i + 1].parse().ok();
@@ -171,6 +184,8 @@ fn parse_cli() -> Option<Config> {
         force,
         abandon,
         invoice,
+        merchant,
+        since,
         expect,
         insecure,
     })
@@ -384,6 +399,8 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    vault.set_merchant(cfg.merchant.clone());
 
     match cfg.subcommand.as_str() {
         "balance" => {
@@ -650,6 +667,75 @@ fn main() {
                 std::process::exit(1);
             }
         },
+        "report" => {
+            let secret = std::env::var("FUPI_CREDIT_SECRET").unwrap_or_else(|_| {
+                eprintln!("set FUPI_CREDIT_SECRET (same value the kiosk was started with)");
+                std::process::exit(1);
+            });
+            let client = vault.client().unwrap_or_else(|| {
+                eprintln!("No ATM client configured");
+                std::process::exit(1);
+            });
+            match client.settlements(cfg.since, cfg.merchant.as_deref(), &secret) {
+                Ok(v) => {
+                    for e in v["entries"].as_array().into_iter().flatten() {
+                        println!(
+                            "#{} {} merchant={} amount={} keyset={} proof={}",
+                            e["seq"], e["at"].as_str().unwrap_or(""), e["merchant"].as_str().unwrap_or(""),
+                            e["amount"], e["keyset_id"].as_str().unwrap_or(""), e["proof"].as_str().unwrap_or("")
+                        );
+                    }
+                    println!("-- merchant balances --");
+                    for m in v["merchants"].as_array().into_iter().flatten() {
+                        println!(
+                            "{}: settled={} paid={} OWED={} ({} proofs)",
+                            m["merchant"].as_str().unwrap_or(""), m["settled"], m["paid"], m["owed"], m["count"]
+                        );
+                    }
+                    let rc = &v["reconcile"];
+                    println!(
+                        "-- reconcile: reserve={} issued={} owed_total={} fully_backed={} ledger_consistent={}",
+                        rc["reserve"], rc["issued_outstanding"], rc["owed_total"], rc["fully_backed"], rc["ledger_consistent"]
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Report failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        "payout" => {
+            if cfg.args.len() < 2 {
+                eprintln!("Usage: fupi-vault payout <merchant> <amount> --ref <bank UTR>");
+                std::process::exit(1);
+            }
+            let amount: u64 = cfg.args[1].parse().unwrap_or_else(|_| {
+                eprintln!("Invalid amount: {}", cfg.args[1]);
+                std::process::exit(1);
+            });
+            let reference = cfg.reference.clone().unwrap_or_else(|| {
+                eprintln!("--ref <bank UTR> is required: it makes the payout replay-safe");
+                std::process::exit(1);
+            });
+            let secret = std::env::var("FUPI_CREDIT_SECRET").unwrap_or_else(|_| {
+                eprintln!("set FUPI_CREDIT_SECRET (same value the kiosk was started with)");
+                std::process::exit(1);
+            });
+            let client = vault.client().unwrap_or_else(|| {
+                eprintln!("No ATM client configured");
+                std::process::exit(1);
+            });
+            match client.payout(&cfg.args[0], amount, &reference, &secret) {
+                Ok(v) => println!(
+                    "PAYOUT RECORDED merchant={} paid={} owed={}",
+                    v["merchant"].as_str().unwrap_or(""), v["paid"], v["owed"]
+                ),
+                Err(e) => {
+                    eprintln!("Payout failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "recover" => {
             if cfg.abandon {
                 match vault.abandon_pending() {

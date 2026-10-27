@@ -148,6 +148,9 @@ type Kiosk struct {
 	allocRefs    map[string]struct{}
 	swapCache    map[string][]string // idempotency: request hash -> signatures
 	swapOrder    []string
+	settlements  []Settlement
+	payouts      []Payout
+	payoutRefs   map[string]struct{}
 	allowAnon    bool
 	creditSecret []byte
 	statePath    string
@@ -193,6 +196,7 @@ func NewKiosk(statePath string) (*Kiosk, error) {
 		depositRefs: map[string]struct{}{},
 		devices:     map[string]*Device{},
 		allocRefs:   map[string]struct{}{},
+		payoutRefs:  map[string]struct{}{},
 		swapCache:   map[string][]string{},
 		statePath:   statePath,
 	}
@@ -331,6 +335,9 @@ type Reconcile struct {
 	SettledCount     int     `json:"settled_count"`
 	DevicesAllocated float64 `json:"devices_allocated"`
 	DevicesLoaded    int     `json:"devices_loaded"`
+	SettledTotal     int     `json:"settled_total"`
+	PaidTotal        int     `json:"paid_total"`
+	OwedTotal        int     `json:"owed_total"`
 	FullyBacked      bool    `json:"fully_backed"`
 	LedgerConsistent bool    `json:"ledger_consistent"`
 }
@@ -339,9 +346,15 @@ func (k *Kiosk) Reconcile() Reconcile {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	var total, alloc float64
-	var loaded int
+	var loaded, settled, paid int
 	for _, d := range k.deposits {
 		total += d.Amount
+	}
+	for _, s := range k.settlements {
+		settled += s.Amount
+	}
+	for _, p := range k.payouts {
+		paid += p.Amount
 	}
 	for _, d := range k.devices {
 		alloc += d.Allocated
@@ -355,8 +368,12 @@ func (k *Kiosk) Reconcile() Reconcile {
 		SettledCount:     len(k.spent),
 		DevicesAllocated: alloc,
 		DevicesLoaded:    loaded,
-		FullyBacked:      float64(k.issued) <= k.reserve+1e-9,
-		LedgerConsistent: math.Abs(total-k.reserve) < 1e-6,
+		SettledTotal:     settled,
+		PaidTotal:        paid,
+		OwedTotal:        settled - paid,
+		// Backing must cover tokens still out AND settled-but-unpaid merchant claims.
+		FullyBacked:      float64(k.issued+settled-paid) <= k.reserve+1e-9,
+		LedgerConsistent: math.Abs(total-float64(paid)-k.reserve) < 1e-6,
 	}
 }
 
@@ -407,7 +424,7 @@ func (k *Kiosk) blindSignNoSave(blindedB64 string, amount int) (string, error) {
 	if key == nil {
 		return "", fmt.Errorf("unsupported denomination %d", amount)
 	}
-	if float64(k.issued+amount) > k.reserve {
+	if float64(k.issued+k.owedTotalLocked()+amount) > k.reserve { // tokens out + merchant claims must stay covered
 		return "", fmt.Errorf("insufficient reserve (1:1 rule)")
 	}
 	raw, err := unb64(blindedB64)
@@ -598,7 +615,14 @@ func (k *Kiosk) checkProofLocked(p Proof) (int, string) {
 // Settle redeems a proof for its face value. If the secret carries a lock, Claimer must be
 // the hex ed25519 signature over the secret bytes by that key. The legacy P2PK field is
 // ignored: it was an unauthenticated label and gave no security.
-func (k *Kiosk) Settle(p Proof) (bool, string) {
+func (k *Kiosk) Settle(p Proof) (bool, string) { return k.SettleFor(p, "") }
+
+// SettleFor is Settle plus a payee label recorded in the settlement log (see settlements.go).
+func (k *Kiosk) SettleFor(p Proof, merchant string) (bool, string) {
+	name, okName := cleanMerchant(merchant)
+	if !okName {
+		name = unlabeled
+	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	amount, reason := k.checkProofLocked(p)
@@ -621,8 +645,13 @@ func (k *Kiosk) Settle(p Proof) (bool, string) {
 	if k.issued < 0 {
 		k.issued = 0
 	}
+	k.settlements = append(k.settlements, Settlement{
+		Seq: len(k.settlements) + 1, At: time.Now().UTC().Format(time.RFC3339),
+		Merchant: name, Amount: amount, KeysetID: p.KeysetID, Proof: proofTag(p.Secret),
+	})
 	if err := k.saveState(); err != nil {
 		delete(k.spent, p.Secret)
+		k.settlements = k.settlements[:len(k.settlements)-1]
 		k.issued = oldIssued
 		return false, "REJECTED: could not persist settlement"
 	}
@@ -748,17 +777,19 @@ type diskDenom struct {
 }
 
 type diskState struct {
-	N         string              `json:"n"` // denomination 1 (legacy keyset)
-	D         string              `json:"d"`
-	Denoms    []diskDenom         `json:"denoms,omitempty"` // every other denomination
-	Reserve   float64             `json:"reserve"`
-	Issued    int                 `json:"issued"`
-	Spent     []string            `json:"spent"`
-	Deposits  []Deposit           `json:"deposits,omitempty"`
-	Devices   map[string]*Device  `json:"devices,omitempty"`
-	AllocRefs []string            `json:"alloc_refs,omitempty"`
-	SwapCache map[string][]string `json:"swap_cache,omitempty"`
-	SwapOrder []string            `json:"swap_order,omitempty"`
+	N           string              `json:"n"` // denomination 1 (legacy keyset)
+	D           string              `json:"d"`
+	Denoms      []diskDenom         `json:"denoms,omitempty"` // every other denomination
+	Reserve     float64             `json:"reserve"`
+	Issued      int                 `json:"issued"`
+	Spent       []string            `json:"spent"`
+	Deposits    []Deposit           `json:"deposits,omitempty"`
+	Devices     map[string]*Device  `json:"devices,omitempty"`
+	AllocRefs   []string            `json:"alloc_refs,omitempty"`
+	SwapCache   map[string][]string `json:"swap_cache,omitempty"`
+	SwapOrder   []string            `json:"swap_order,omitempty"`
+	Settlements []Settlement        `json:"settlements,omitempty"`
+	Payouts     []Payout            `json:"payouts,omitempty"`
 }
 
 func readState(path string) (*diskState, error) {
@@ -781,14 +812,16 @@ func (k *Kiosk) saveState() error {
 		return nil
 	}
 	st := diskState{
-		N:         b64(k.key.N.Bytes()),
-		D:         b64(k.key.D.Bytes()),
-		Reserve:   k.reserve,
-		Issued:    k.issued,
-		Deposits:  k.deposits,
-		Devices:   k.devices,
-		SwapCache: k.swapCache,
-		SwapOrder: k.swapOrder,
+		N:           b64(k.key.N.Bytes()),
+		D:           b64(k.key.D.Bytes()),
+		Reserve:     k.reserve,
+		Issued:      k.issued,
+		Deposits:    k.deposits,
+		Devices:     k.devices,
+		SwapCache:   k.swapCache,
+		SwapOrder:   k.swapOrder,
+		Settlements: k.settlements,
+		Payouts:     k.payouts,
 	}
 	for _, d := range Denominations {
 		if d == 1 || k.keys[d] == nil {
@@ -875,10 +908,17 @@ func (k *Kiosk) applyState(st *diskState) error {
 	}
 	k.deposits = append([]Deposit(nil), st.Deposits...)
 	k.depositRefs = map[string]struct{}{}
+	k.settlements = append([]Settlement(nil), st.Settlements...)
+	k.payouts = append([]Payout(nil), st.Payouts...)
+	k.payoutRefs = map[string]struct{}{}
 	var sum float64
 	for _, d := range k.deposits {
 		k.depositRefs[d.Ref] = struct{}{}
 		sum += d.Amount
+	}
+	for _, p := range k.payouts {
+		k.payoutRefs[p.Ref] = struct{}{}
+		sum -= float64(p.Amount) // money that left the bank
 	}
 	// State written before the ledger existed: book the gap as an opening balance.
 	if gap := k.reserve - sum; gap > 1e-9 {
@@ -1312,6 +1352,57 @@ func SetupMux(k *Kiosk, tlsEnabled bool, fingerprint string) *http.ServeMux {
 		writeJSON(w, 200, map[string]any{"signatures": sigs})
 	})
 
+	// Operator report: HMAC over the request URI (path + query), since a GET has no body.
+	mux.HandleFunc("/v1/settlements", func(w http.ResponseWriter, r *http.Request) {
+		if !getOnly(w, r) {
+			return
+		}
+		if !k.CreditEnabled() {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "operator endpoints disabled"})
+			return
+		}
+		if !k.VerifyCreditAuth([]byte(r.URL.RequestURI()), r.Header.Get("X-Fupi-Signature")) {
+			writeJSON(w, 401, map[string]string{"error": "bad or missing X-Fupi-Signature"})
+			return
+		}
+		since, _ := strconv.Atoi(r.URL.Query().Get("since"))
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		entries, bals := k.SettlementReport(since, limit, r.URL.Query().Get("merchant"))
+		writeJSON(w, 200, map[string]any{"entries": entries, "merchants": bals, "reconcile": k.Reconcile()})
+	})
+
+	mux.HandleFunc("/v1/payout", func(w http.ResponseWriter, r *http.Request) {
+		if !postOnly(w, r) {
+			return
+		}
+		raw, ok := k.authedBody(w, r)
+		if !ok {
+			return
+		}
+		var body struct {
+			Merchant string `json:"merchant"`
+			Amount   int    `json:"amount"`
+			Ref      string `json:"ref"`
+		}
+		if json.Unmarshal(raw, &body) != nil {
+			writeJSON(w, 400, map[string]string{"error": "bad request"})
+			return
+		}
+		bal, err := k.RecordPayout(body.Merchant, body.Amount, body.Ref)
+		switch {
+		case errors.Is(err, ErrDupPayout):
+			writeJSON(w, 409, map[string]string{"error": err.Error()})
+		case errors.Is(err, ErrOverPayout):
+			writeJSON(w, 402, map[string]any{"error": err.Error(), "owed": bal.Owed})
+		case errors.Is(err, ErrBadMerchant), errors.Is(err, ErrBadRef), errors.Is(err, ErrBadAmount):
+			writeJSON(w, 400, map[string]string{"error": err.Error()})
+		case err != nil:
+			writeJSON(w, 500, map[string]string{"error": "could not persist payout"})
+		default:
+			writeJSON(w, 200, bal)
+		}
+	})
+
 	mux.HandleFunc("/v1/settle", func(w http.ResponseWriter, r *http.Request) {
 		if !postOnly(w, r) {
 			return
@@ -1321,7 +1412,7 @@ func SetupMux(k *Kiosk, tlsEnabled bool, fingerprint string) *http.ServeMux {
 			writeJSON(w, 400, map[string]string{"error": "bad proof"})
 			return
 		}
-		ok, msg := k.Settle(proof)
+		ok, msg := k.SettleFor(proof, r.Header.Get("X-Fupi-Merchant"))
 		code := 200
 		if !ok {
 			code = 409 // conflict: double-spend / bad sig / lock violation

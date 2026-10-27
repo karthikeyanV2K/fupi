@@ -18,6 +18,7 @@ Covers the hardened flow:
    8. 5-way concurrent settle race: exactly one winner
    9. Merchant terminal: offline accept with invoice/amount checks, replay refused, batch settle,
       a customer who double-spends is caught at settlement and shown on the receipt
+  10. Cash-out: operator settlement report, payout recorded (reserve and owed both fall), replay/overpay refused
 """
 
 import base64
@@ -303,13 +304,35 @@ def main():
         assert "ACCEPTED receipt #3 amount=10" in vault("shop", "accept", t10, "--invoice", "INV-3").stdout
         # Alice settles the 20 herself before the shop does (offline double-spend).
         assert vault("alice", "settle", t20).stdout.count("SETTLED OK") >= 1
-        r = vault("shop", "settle-all", check=False)
+        r = vault("shop", "settle-all", "--merchant", "cafe-7", check=False)
         assert r.returncode == 2 and "SETTLED value=47 rejected=20 still_held=0" in r.stdout, r.stdout
         rcpts = vault("shop", "receipts").stdout
         assert "invoice=INV-1 amount=37 settled=37 rejected=0 pending=0" in rcpts, rcpts
         assert "invoice=INV-2 amount=20 settled=0 rejected=20 pending=0" in rcpts, rcpts
         assert "invoice=INV-3 amount=10 settled=10 rejected=0 pending=0" in rcpts, rcpts
         print("  -> 47 settled to the merchant; the double-spent 20 shows as rejected on its receipt")
+
+        step(11, "Cash-out: operator report, bank payout recorded, replay and overpay refused")
+        assert vault("alice", "report", check=False).returncode != 0, "report without the operator secret"
+        rep = vault("alice", "report", env=good).stdout
+        assert "cafe-7: settled=47 paid=0 OWED=47 (5 proofs)" in rep, rep
+        assert "merchant=cafe-7 amount=20 keyset=go-mvp-d20" in rep and "merchant=cafe-7 amount=2 keyset=go-mvp-d2" in rep, rep  # per proof
+        assert "merchant=(unlabeled)" in rep  # the customer's own settlements had no payee label
+        rc0 = http_json("/v1/reconcile")
+        assert rc0["owed_total"] == rc0["settled_total"] and rc0["fully_backed"], rc0
+        assert vault("alice", "payout", "cafe-7", "100", "--ref", "UTR-P1", env=good, check=False).returncode != 0, \
+            "paid out more than owed"
+        assert vault("alice", "payout", "cafe-7", "40", "--ref", "UTR-P2", check=False).returncode != 0, \
+            "payout without the operator secret"
+        assert "PAYOUT RECORDED merchant=cafe-7 paid=40 owed=7" in \
+            vault("alice", "payout", "cafe-7", "40", "--ref", "UTR-P2", env=good).stdout
+        assert vault("alice", "payout", "cafe-7", "7", "--ref", "UTR-P2", env=good, check=False).returncode != 0, \
+            "replayed payout reference was accepted"
+        rc1 = http_json("/v1/reconcile")
+        assert rc1["reserve"] == rc0["reserve"] - 40 and rc1["paid_total"] == 40, (rc0, rc1)
+        assert rc1["fully_backed"] and rc1["ledger_consistent"], rc1
+        assert "cafe-7: settled=47 paid=40 OWED=7" in vault("alice", "report", "--merchant", "cafe-7", env=good).stdout
+        print("  -> 40 paid out: owed 47 -> 7, reserve fell by 40, ledger still consistent")
 
         rc = http_json("/v1/reconcile")
         assert rc["fully_backed"] and rc["ledger_consistent"], rc
