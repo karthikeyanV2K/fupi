@@ -5,7 +5,7 @@ Proves the FUPI protocol is language-independent:
   -> Go settle (200) -> replay (409) -> thief claim (409, defense-in-depth).
 
 Start the Go kiosk first (the credit secret enables the authenticated /v1/credit):
-  FUPI_CREDIT_SECRET=xyz ./kiosk-go -port 8890 -tls=true
+  FUPI_CREDIT_SECRET=xyz ./kiosk-go -port 8890 -tls=true -allow-anonymous-issuance
 Then:
   FUPI_CREDIT_SECRET=xyz python kiosk-go/cross_lang_test.py 8890 https
 """
@@ -89,13 +89,14 @@ def main():
                 break
         blinded = pow(m * pow(rr, e, n), 1, n)
         st, rsp = post("/v1/blind-sign", {"blinded_message": b64i(blinded), "amount": 1})
+        # needs the kiosk started with -allow-anonymous-issuance (dev only); real vaults sign with a device key
         assert st == 200, rsp
         sig_int = int.from_bytes(base64.urlsafe_b64decode(rsp["blind_signature"] + "=="), "big")
         sg = sig_int * pow(rr, -1, n) % n
         assert pow(sg, e, n) == m, "unblinded signature does not verify"
         return {"secret": secret, "sig": b64i(sg), "n": b64i(n), "e": e}
 
-    secret = "cross-lang-token-001"
+    secret = f"cross-lang-token-{random.getrandbits(48):x}"
     proof = issue(secret)
     print("[3] Python unblinded Go's RSA-2048 signature, verifies: True")
     s, r = post("/v1/settle", proof)
@@ -111,13 +112,36 @@ def main():
     assert s == 409
 
     # A locked secret (lock key = 32 bytes of hex) cannot be claimed without that key's signature.
-    locked = issue("cross-lang-locked-003|lock=" + "11" * 32)
+    locked = issue(f"cross-lang-locked-{random.getrandbits(48):x}|lock=" + "11" * 32)
     s, r = post("/v1/settle", dict(locked, p2pk="shop", claimer="thief"))
     print(f"[6] locked proof, thief label: HTTP {s} -> {r['result']}")
     assert s == 409
     s, r = post("/v1/settle", dict(locked, claimer="ab" * 64))
     print(f"[7] locked proof, forged claim signature: HTTP {s} -> {r['result']}")
     assert s == 409
+
+    # Denominations: the 50 keyset signs a 50-proof; face value comes from the keyset id.
+    r = get("/v1/keysets")
+    ks50 = [k for k in r["keysets"] if k["keyset_id"] == "go-mvp-d50"][0]
+    n50 = int.from_bytes(base64.urlsafe_b64decode(ks50["n"] + "=="), "big")
+    sec = "cross-lang-d50-" + str(random.getrandbits(32))
+    m50 = int.from_bytes(hashlib.sha256(sec.encode()).digest(), "big") % n50
+    while True:
+        rr = random.randrange(2, n50 - 1)
+        if math.gcd(rr, n50) == 1:
+            break
+    bl = m50 * pow(rr, ks50["e"], n50) % n50
+    st, rsp = post("/v1/blind-sign", {"blinded_message": b64i(bl), "amount": 50})
+    assert st == 200, rsp
+    sg = int.from_bytes(base64.urlsafe_b64decode(rsp["blind_signature"] + "=="), "big") * pow(rr, -1, n50) % n50
+    assert pow(sg, ks50["e"], n50) == m50
+    before = get("/v1/info")["issued"]
+    s, r = post("/v1/settle", {"secret": sec, "sig": b64i(sg), "keyset_id": "go-mvp-d50"})
+    assert s == 200, r
+    print(f"[8] 50-denomination proof settled; issued {before} -> {get('/v1/info')['issued']}")
+    s, r = post("/v1/settle", {"secret": sec, "sig": b64i(sg), "keyset_id": "go-mvp-00"})
+    assert s == 409, (s, r)  # same signature under the wrong (1) keyset must not verify
+    print("[9] relabelling a 50 as a 1 (or the reverse) is rejected")
 
     print("\nCROSS-LANGUAGE INTEROP: ALL PASS (Python + Go, RSA-2048, HTTPS/TLS)")
 

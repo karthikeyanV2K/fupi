@@ -105,10 +105,10 @@ func TestReconcileTracksLedgerAndIssuance(t *testing.T) {
 	}
 }
 
-func TestBlindSignAmountMustBeOne(t *testing.T) {
+func TestBlindSignRejectsUnsupportedDenominations(t *testing.T) {
 	k, _ := NewKiosk("")
 	k.CreditReserve(100)
-	for _, amt := range []int{0, 2, 1000, -1, int(^uint(0) >> 1)} {
+	for _, amt := range []int{0, 3, 1000, -1, int(^uint(0) >> 1)} {
 		if _, err := k.BlindSign("Ag", amt); err == nil {
 			t.Fatalf("amount %d accepted", amt)
 		}
@@ -236,4 +236,10 @@ func TestLegacyStateGetsOpeningBalance(t *testing.T) {
 	if rc := k2.Reconcile(); rc.DepositsTotal != 20 || !rc.LedgerConsistent {
 		t.Fatalf("legacy reserve not booked: %+v", rc)
 	}
+}
+
+func hmacHex(secret, body []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	return hex.EncodeToString(mac.Sum(nil))
 }

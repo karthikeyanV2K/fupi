@@ -164,15 +164,34 @@ pub fn generate_claim_keypair() -> (String, String) {
     (hex_encode(&sk.to_bytes()), hex_encode(sk.verifying_key().as_bytes()))
 }
 
-/// hex ed25519 signature over the secret bytes: the proof of ownership a
-/// locked token needs at settlement.
-pub fn claim_signature(secret_key_hex: &str, secret: &str) -> Result<String, CryptoError> {
+/// hex ed25519 signature over arbitrary bytes by a hex secret key.
+pub fn sign_bytes(secret_key_hex: &str, msg: &[u8]) -> Result<String, CryptoError> {
     use ed25519_dalek::Signer;
     let sk: [u8; 32] = hex_decode(secret_key_hex)
         .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| CryptoError::InvalidLock("claim key must be 32 bytes of hex".into()))?;
+        .ok_or_else(|| CryptoError::InvalidLock("key must be 32 bytes of hex".into()))?;
     let sk = ed25519_dalek::SigningKey::from_bytes(&sk);
-    Ok(hex_encode(&sk.sign(secret.as_bytes()).to_bytes()))
+    Ok(hex_encode(&sk.sign(msg).to_bytes()))
+}
+
+/// hex ed25519 signature over the secret bytes: the proof of ownership a
+/// locked token needs at settlement.
+pub fn claim_signature(secret_key_hex: &str, secret: &str) -> Result<String, CryptoError> {
+    sign_bytes(secret_key_hex, secret.as_bytes())
+}
+
+/// Public key (hex) for a secret key (hex).
+pub fn public_key_of(secret_key_hex: &str) -> Result<String, CryptoError> {
+    let sk: [u8; 32] = hex_decode(secret_key_hex)
+        .and_then(|b| b.try_into().ok())
+        .ok_or_else(|| CryptoError::InvalidLock("key must be 32 bytes of hex".into()))?;
+    let sk = ed25519_dalek::SigningKey::from_bytes(&sk);
+    Ok(hex_encode(sk.verifying_key().as_bytes()))
+}
+
+/// Exactly what a device signs to request one proof (must match the kiosk's DeviceSignMessage).
+pub fn device_sign_message(device_hex: &str, seq: u64, amount: u64, blinded_b64: &str) -> String {
+    format!("fupi-blind-sign-v1|{device_hex}|{seq}|{amount}|{blinded_b64}")
 }
 
 /// SHA-256 of the modulus bytes, hex: what a human compares out-of-band when pinning a keyset.
@@ -262,6 +281,20 @@ mod tests {
         assert!(lock_of("fupi-x|lock=zz").is_err());
         assert!(lock_of("fupi-x|lock=abcd").is_err());
         assert!(generate_locked_secret("abcd").is_err());
+    }
+
+    #[test]
+    fn test_device_signature_matches_kiosk_message_format() {
+        use ed25519_dalek::{Signature, VerifyingKey};
+        let (sk, pk) = generate_claim_keypair();
+        assert_eq!(public_key_of(&sk).unwrap(), pk);
+        let msg = device_sign_message(&pk, 7, 50, "AbCd");
+        assert_eq!(msg, format!("fupi-blind-sign-v1|{pk}|7|50|AbCd"));
+        let sig = sign_bytes(&sk, msg.as_bytes()).unwrap();
+        let vk = VerifyingKey::from_bytes(&hex_decode(&pk).unwrap().try_into().unwrap()).unwrap();
+        let sig = Signature::from_slice(&hex_decode(&sig).unwrap()).unwrap();
+        assert!(vk.verify_strict(msg.as_bytes(), &sig).is_ok());
+        assert!(vk.verify_strict(b"other", &sig).is_err());
     }
 
     #[test]

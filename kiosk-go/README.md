@@ -75,3 +75,14 @@ export FUPI_CREDIT_SECRET="$(openssl rand -hex 32)"
 - The signing key is stored in the state file (mode 0600) in plaintext; use disk encryption / an HSM before real money.
 - State is rewritten in full on every sign/settle (O(n)); fine for pilots, not for scale.
 - The reserve is a number in a file. Real money needs the bank-side reconciliation described in docs/CODE_PLAN.md.
+
+## W2: denominations, devices, swap
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `GET /v1/keysets` | none | public key per denomination (`go-mvp-00` = 1, `go-mvp-d<N>` = N) |
+| `POST /v1/allocate` | HMAC (`X-Fupi-Signature`) + unique `ref` | give a device (ed25519 pubkey) issuance quota; total allocations <= reserve |
+| `POST /v1/blind-sign` | device signature (`device`, `seq`, `device_sig`) | issue one proof of `amount` (a supported denomination); `-allow-anonymous-issuance` disables the check (dev only) |
+| `POST /v1/swap` | the proofs themselves | unlocked proofs in, same-total blind outputs out; idempotent |
+
+Device signature message: `fupi-blind-sign-v1|<device hex>|<seq>|<amount>|<blinded b64>`, ed25519, `seq` strictly increasing.
