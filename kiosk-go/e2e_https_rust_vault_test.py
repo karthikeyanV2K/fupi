@@ -334,6 +334,33 @@ def main():
         assert "cafe-7: settled=47 paid=40 OWED=7" in vault("alice", "report", "--merchant", "cafe-7", env=good).stdout
         print("  -> 40 paid out: owed 47 -> 7, reserve fell by 40, ledger still consistent")
 
+        step(12, "Pilot daily check against the live kiosk (scripts/pilot_check.py)")
+        check = os.path.join(ROOT_DIR, "scripts", "pilot_check.py")
+        plog = os.path.join(ROOT_DIR, "test_pilot_log_e2e.jsonl")
+        if os.path.exists(plog):
+            os.remove(plog)
+        reserve_now = http_json("/v1/reconcile")["reserve"]
+
+        def pilot(bank, extra_env=None):
+            e = dict(os.environ, FUPI_CREDIT_SECRET=CREDIT_SECRET)
+            e.update(extra_env or {})
+            return subprocess.run(
+                [sys.executable, check, "--atm", ATM_URL, "--pin-tls", PIN, "--bank-balance", str(bank),
+                 "--max-total", "500", "--log", plog],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=e)
+
+        r = pilot(reserve_now)
+        assert r.returncode == 0 and "RESULT: PASS" in r.stdout and "settlement log sums to" in r.stdout, r.stdout + r.stderr
+        r = pilot(reserve_now)  # second run compares with the first
+        assert r.returncode == 0 and "explained" in r.stdout, r.stdout
+        r = pilot(reserve_now - 1)  # the bank holds LESS than the reserve: must fail loudly
+        assert r.returncode == 1 and "BELOW reserve" in r.stdout, r.stdout
+        bad = subprocess.run([sys.executable, check, "--atm", ATM_URL, "--pin-tls", "00" * 32, "--log", plog],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        assert bad.returncode != 0 and "does not match" in (bad.stdout + bad.stderr), "wrong TLS pin accepted"
+        os.remove(plog)
+        print("  -> passes on a healthy kiosk, fails when the bank balance is below the reserve, refuses a wrong pin")
+
         rc = http_json("/v1/reconcile")
         assert rc["fully_backed"] and rc["ledger_consistent"], rc
         assert rc["issued_outstanding"] == int(vault("alice", "balance").stdout.strip()), rc
