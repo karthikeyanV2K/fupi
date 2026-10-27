@@ -89,6 +89,7 @@ pub struct Vault {
     storage: FlashStorage,
     state: FlashState,
     client: Option<AtmClient>,
+    merchant: Option<String>,
 }
 
 impl Vault {
@@ -98,7 +99,13 @@ impl Vault {
             storage,
             state,
             client,
+            merchant: None,
         })
+    }
+
+    /// Payee label sent with every settlement (merchant mode).
+    pub fn set_merchant(&mut self, label: Option<String>) {
+        self.merchant = label;
     }
 
     pub fn set_client(&mut self, client: AtmClient) {
@@ -769,7 +776,7 @@ impl Vault {
             if let (Some(key), Some(_)) = (claim_key.as_deref(), lock_of(&p.secret)?) {
                 p.claimer = Some(claim_signature(key, &p.secret)?);
             }
-            let (ok, msg) = client.settle(p)?;
+            let (ok, msg) = client.settle_as(p, self.merchant.as_deref())?;
             results.push((p.secret.clone(), ok, msg));
         }
 
@@ -849,7 +856,7 @@ impl Vault {
             if let (Some(key), Some(_)) = (claim_key.as_deref(), lock_of(&p.secret)?) {
                 p.claimer = Some(claim_signature(key, &p.secret)?);
             }
-            let (ok, msg) = match client.settle(&p) {
+            let (ok, msg) = match client.settle_as(&p, self.merchant.as_deref()) {
                 Ok(r) => r,
                 Err(ClientError::HttpStatus(code, _)) if code != 409 && code < 500 => {
                     (false, format!("refused: HTTP {code}"))

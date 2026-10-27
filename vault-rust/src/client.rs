@@ -362,16 +362,21 @@ impl AtmClient {
     }
 
     pub fn settle(&self, proof: &Proof) -> Result<(bool, String), ClientError> {
+        self.settle_as(proof, None)
+    }
+
+    /// Settle, naming the payee (`X-Fupi-Merchant`). The label only says who the operator
+    /// should pay; it is not authenticated and gives no claim on the money.
+    pub fn settle_as(&self, proof: &Proof, merchant: Option<&str>) -> Result<(bool, String), ClientError> {
         let url = format!("{}/v1/settle", self.base_url);
         let req_json = serde_json::to_string(proof)
             .map_err(|e| ClientError::Serialization(e.to_string()))?;
 
-        match self
-            .agent
-            .post(&url)
-            .set("Content-Type", "application/json")
-            .send_string(&req_json)
-        {
+        let mut req = self.agent.post(&url).set("Content-Type", "application/json");
+        if let Some(m) = merchant {
+            req = req.set("X-Fupi-Merchant", m);
+        }
+        match req.send_string(&req_json) {
             Ok(resp) => {
                 let resp_str = resp
                     .into_string()
@@ -394,6 +399,50 @@ impl AtmClient {
             }
             Err(e) => Err(ClientError::Transport(e.to_string())),
         }
+    }
+
+    /// Operator report: settlement log since `since` plus every merchant's owed balance.
+    /// The HMAC covers the request URI (a GET has no body).
+    pub fn settlements(
+        &self,
+        since: u64,
+        merchant: Option<&str>,
+        secret: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        let mut uri = format!("/v1/settlements?since={since}");
+        if let Some(m) = merchant {
+            uri.push_str(&format!("&merchant={m}"));
+        }
+        let sig = Self::hmac_hex(secret, &uri)?;
+        match self
+            .agent
+            .get(&format!("{}{}", self.base_url, uri))
+            .set("X-Fupi-Signature", &sig)
+            .call()
+        {
+            Ok(r) => {
+                let body = r.into_string().map_err(|e| ClientError::Transport(e.to_string()))?;
+                serde_json::from_str(&body).map_err(|e| ClientError::Serialization(e.to_string()))
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                Err(ClientError::HttpStatus(code, resp.into_string().unwrap_or_default()))
+            }
+            Err(e) => Err(ClientError::Transport(e.to_string())),
+        }
+    }
+
+    /// Operator action: record a bank payout to a merchant (lowers what they are owed).
+    pub fn payout(
+        &self,
+        merchant: &str,
+        amount: u64,
+        reference: &str,
+        secret: &str,
+    ) -> Result<serde_json::Value, ClientError> {
+        let body = serde_json::json!({"merchant": merchant, "amount": amount, "ref": reference}).to_string();
+        let sig = Self::hmac_hex(secret, &body)?;
+        let resp = self.post_json("/v1/payout", &body, Some(&sig))?;
+        serde_json::from_str(&resp).map_err(|e| ClientError::Serialization(e.to_string()))
     }
 }
 

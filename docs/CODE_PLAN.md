@@ -37,7 +37,7 @@ The bank holds the money. The vault holds *claims* on it. The kiosk's job is to 
 | **W1** | Deposit-authorised issuance and an append-only ledger | **done** (this PR) |
 | **W2** | Denominations (1,2,5,10,20,50,100,200,500), one signing key per denomination, device identity (signed load requests), change-making | **done** |
 | **W3** | Merchant terminal: verify-only device, accumulates, settles later | **done** |
-| W4 | Cash-out: settlement report first (operator pays by bank app), payout automation later | todo |
+| **W4** | Cash-out: settlement report first (operator pays by bank app), payout automation later | **done** (report + payout ledger; automation not started) |
 | W5 | Field pilot: 5-10 known people, own funds, tiny cap, written consent, daily reconciliation | todo |
 
 ### W0: what was fixed
@@ -90,9 +90,25 @@ Risk the terminal cannot remove: until `settle-all` succeeds, an offline token i
 first-to-settle-wins. Mitigations are the offline cap per device and settling often.
 Tests: `vault-rust/tests/w3_tests.rs`, e2e step 10.
 
-**W4: cash-out**
-* `GET /v1/settlements?since=` report (merchant, amount, time, proof count) for the operator.
-* Manual payout first; automation (bank API / payout rail) only after a licensed issuer is in the loop.
+### W4: cash-out (done)
+
+```
+merchant --settle--> kiosk: settlement log {seq, time, payee label, amount, keyset, proof tag}
+operator: report  -> owed per merchant -> pays from the bank app -> payout <merchant> <amt> --ref <UTR>
+kiosk:    payout  -> owed falls, reserve falls (the bank balance fell by the same amount)
+```
+
+| Piece | Behaviour | Test |
+|---|---|---|
+| Log | every accepted settlement is appended in the same save that marks the proof spent; rejected ones are not logged | `TestSettlementLogGroupsByMerchantAndSanitisesLabels` |
+| Payee label | `X-Fupi-Merchant` header (`--merchant`); sanitised, unlabeled if absent. It says who to PAY, it is not authentication: a bearer proof is cash | same |
+| `GET /v1/settlements?since=&merchant=` | operator-only; HMAC over the request URI so a signed query can't be replayed as another | `TestSettlementEndpointsNeedOperatorAuth` |
+| `POST /v1/payout {merchant, amount, ref}` | operator-only; unique bank ref; amount <= owed; lowers reserve | `TestPayoutLowersOwedAndReserveAndIsReplaySafe` |
+| Backing rule | `reserve >= issued + owed`; **issuance now counts merchant claims**, so the kiosk cannot hand out money already promised to a merchant | `TestOwedMoneyCountsAgainstIssuance` |
+| Ledger | `deposits - payouts == reserve` (`ledger_consistent`) | restart + reconcile tests, e2e step 11 |
+
+Operator CLI: `report [--since N] [--merchant M]`, `payout <merchant> <amount> --ref <UTR>`.
+Automation (bank payout API) stays out until a licensed entity is in the loop.
 
 **W5: pilot**
 * Own funds, closed group, written consent, a hard per-device cap, daily `reconcile` log kept.
@@ -111,7 +127,8 @@ Tests: `vault-rust/tests/w3_tests.rs`, e2e step 10.
 | Pico client | plain HTTP only; no locks, claim signatures, denominations or device key yet |
 | Lost response | if a blind-sign response is lost after the kiosk signed, that proof is lost (quota consumed); swap has write-ahead recovery, top-up does not yet |
 | Swap refusals | the kiosk answers all swap errors with 409, so a refused swap needs an explicit `recover --abandon` after a retry |
-| Reserve | a number in a file; the bank balance is not checked automatically |
+| Reserve | a number in a file; the bank balance is not checked automatically, and payouts are recorded by the operator after the bank transfer (no link to the bank) |
+| Settlement log | settlements made before W4 are not in the log (owed starts at 0); payee labels are unauthenticated, so the operator confirms who to pay out of band; the log is a full rewrite per save like the rest of the state |
 | Legal | none of this is licensed for public use; see the approval paths discussed separately |
 
 ## 5. How to run everything

@@ -86,3 +86,13 @@ export FUPI_CREDIT_SECRET="$(openssl rand -hex 32)"
 | `POST /v1/swap` | the proofs themselves | unlocked proofs in, same-total blind outputs out; idempotent |
 
 Device signature message: `fupi-blind-sign-v1|<device hex>|<seq>|<amount>|<blinded b64>`, ed25519, `seq` strictly increasing.
+
+## W4: settlement report and payouts
+
+| Endpoint | Auth | Purpose |
+|---|---|---|
+| `POST /v1/settle` | proof | optional `X-Fupi-Merchant: <label>` records the payee in the settlement log |
+| `GET /v1/settlements?since=<seq>&merchant=<label>` | HMAC of the request URI | log entries + per-merchant settled / paid / owed + reconcile |
+| `POST /v1/payout {merchant, amount, ref}` | HMAC of the body + unique `ref` | record a bank payout: lowers owed and reserve; amount must not exceed owed |
+
+`GET /v1/reconcile` now also returns `settled_total`, `paid_total`, `owed_total`; `fully_backed` means `reserve >= issued + owed`.
