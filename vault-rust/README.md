@@ -128,3 +128,11 @@ fupi-vault accept <token> --invoice INV-1 --expect 37   # offline; refuses repla
 fupi-vault receipts                              # audit log with settlement status
 fupi-vault settle-all                            # when online; exit 2 if any proof was rejected
 ```
+
+## W4: cash-out
+
+```
+fupi-vault settle-all --merchant cafe-7        # merchant: settle and name the payee
+FUPI_CREDIT_SECRET=... fupi-vault report       # OPERATOR: who is owed what
+FUPI_CREDIT_SECRET=... fupi-vault payout cafe-7 40 --ref UTR123   # after paying them from the bank app
+```
