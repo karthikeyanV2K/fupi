@@ -38,7 +38,7 @@ The bank holds the money. The vault holds *claims* on it. The kiosk's job is to 
 | **W2** | Denominations (1,2,5,10,20,50,100,200,500), one signing key per denomination, device identity (signed load requests), change-making | **done** |
 | **W3** | Merchant terminal: verify-only device, accumulates, settles later | **done** |
 | **W4** | Cash-out: settlement report first (operator pays by bank app), payout automation later | **done** (report + payout ledger; automation not started) |
-| W5 | Field pilot: 5-10 known people, own funds, tiny cap, written consent, daily reconciliation | todo |
+| **W5** | Field pilot: 5-10 known people, own funds, tiny cap, written consent, daily reconciliation | **tooling + runbook done**; the 30-day run itself is yours |
 
 ### W0: what was fixed
 
@@ -110,10 +110,16 @@ kiosk:    payout  -> owed falls, reserve falls (the bank balance fell by the sam
 Operator CLI: `report [--since N] [--merchant M]`, `payout <merchant> <amount> --ref <UTR>`.
 Automation (bank payout API) stays out until a licensed entity is in the loop.
 
-**W5: pilot**
-* Own funds, closed group, written consent, a hard per-device cap, daily `reconcile` log kept.
-* Success criteria: reconcile matches to the rupee for 30 days; zero lost tokens; every failure
-  recoverable from the outbox/journal.
+### W5: pilot (tooling done)
+
+* `docs/PILOT_RUNBOOK.md`: parameters, roles, day-0 setup, daily routine, incidents, wind-down, pass/fail.
+* `docs/PILOT_CONSENT.md`: participant consent template (have it reviewed).
+* `scripts/pilot_check.py`: daily check (exit 1 = stop issuing). Verifies fully-backed / ledger invariants,
+  **bank balance vs reserve**, pilot cap, day-over-day monotonic totals (state rollback or tampering), every
+  reserve change explained by a deposit or payout, and the settlement log summing to reconcile. Appends an
+  audit line to `pilot_log.jsonl`. Tests: `scripts/test_pilot_check.py`, e2e step 12.
+* Success criteria: reconcile matches to the rupee for 30 days; zero lost tokens; every failure recoverable
+  from the outbox/journal.
 
 ## 4. Known limits (not fixed in this PR)
 
@@ -138,5 +144,6 @@ Automation (bank payout API) stays out until a licensed entity is in the loop.
 (cd vault-rust && cargo test && cargo build)
 python3 mvp/test_mvp.py
 python3 mvp/bank_rail.py --mode selftest
+python3 scripts/test_pilot_check.py
 python3 kiosk-go/e2e_https_rust_vault_test.py
 ```
