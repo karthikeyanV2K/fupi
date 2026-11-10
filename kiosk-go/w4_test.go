@@ -74,11 +74,13 @@ func TestPayoutLowersOwedAndReserveAndIsReplaySafe(t *testing.T) {
 	if _, err := k.RecordPayout("nobody", 1, "UTR-B"); err != ErrOverPayout {
 		t.Fatalf("unknown merchant owed nothing: got %v", err)
 	}
+	// NOTE: "" now explicitly selects the unlabeled bucket (see RecordPayout).
+	// Here that bucket owes nothing, so it fails with ErrOverPayout, not ErrBadMerchant.
 	for _, c := range []struct {
 		m, ref string
 		amt    int
 		want   error
-	}{{"", "r", 1, ErrBadMerchant}, {"x y", "r", 1, ErrBadMerchant}, {"shop-1", "", 1, ErrBadRef}, {"shop-1", "r", 0, ErrBadAmount}} {
+	}{{"", "r", 1, ErrOverPayout}, {"(x)", "r", 1, ErrBadMerchant}, {"x y", "r", 1, ErrBadMerchant}, {"shop-1", "", 1, ErrBadRef}, {"shop-1", "r", 0, ErrBadAmount}} {
 		if _, err := k.RecordPayout(c.m, c.amt, c.ref); err != c.want {
 			t.Fatalf("%+v: got %v", c, err)
 		}
@@ -93,6 +95,30 @@ func TestPayoutLowersOwedAndReserveAndIsReplaySafe(t *testing.T) {
 	rc := k.Reconcile()
 	if rc.Reserve != 380 || rc.PaidTotal != 120 || rc.OwedTotal != 30 || !rc.FullyBacked || !rc.LedgerConsistent {
 		t.Fatalf("reconcile after payout: %+v", rc)
+	}
+}
+
+func TestUnlabeledBucketIsPayoutable(t *testing.T) {
+	k := newDenomKiosk(t)
+	k.allowAnon = true
+	k.CreditReserve(100)
+	settleN(t, k, "", 50, "w4-u1") // no merchant header -> unlabeled bucket (50 is a denomination)
+	if b := balanceOf(t, k, unlabeled); b.Settled != 50 || b.Owed != 50 {
+		t.Fatalf("unlabeled bucket: %+v", b)
+	}
+	// "" and the literal "(unlabeled)" both address the same bucket; both must pay.
+	if _, err := k.RecordPayout("", 20, "UTR-U1"); err != nil {
+		t.Fatalf("payout via empty label: %v", err)
+	}
+	if _, err := k.RecordPayout(unlabeled, 30, "UTR-U2"); err != nil {
+		t.Fatalf("payout via literal label: %v", err)
+	}
+	if b := balanceOf(t, k, unlabeled); b.Owed != 0 || b.Paid != 50 {
+		t.Fatalf("unlabeled after payout: %+v", b)
+	}
+	rc := k.Reconcile()
+	if rc.OwedTotal != 0 || rc.PaidTotal != 50 || rc.Reserve != 50 || !rc.FullyBacked || !rc.LedgerConsistent {
+		t.Fatalf("reconcile after unlabeled payout: %+v", rc)
 	}
 }
 

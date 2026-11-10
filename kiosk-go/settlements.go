@@ -42,7 +42,7 @@ type MerchantBalance struct {
 }
 
 var (
-	ErrBadMerchant = errors.New("merchant required (1-64 chars of A-Z a-z 0-9 . _ @ -)")
+	ErrBadMerchant = errors.New(`merchant label must be 1-64 chars of A-Z a-z 0-9 . _ @ - (or "(unlabeled)"/empty to pay the unlabeled bucket)`)
 	ErrOverPayout  = errors.New("payout exceeds what is owed to this merchant")
 	ErrDupPayout   = errors.New("duplicate payout reference")
 )
@@ -141,8 +141,16 @@ func (k *Kiosk) SettlementReport(since, limit int, merchant string) ([]Settlemen
 // both what the merchant is owed and the reserve (the bank balance went down by the same
 // amount). Unique ref (bank UTR) makes it replay-safe.
 func (k *Kiosk) RecordPayout(merchant string, amount int, ref string) (MerchantBalance, error) {
+	// The unlabeled bucket is a real, payable bucket: it collects settlements
+	// that arrived with no (or invalid) merchant header. W4 bug fix — it used
+	// to be owed on the books forever, because cleanMerchant("") maps to the
+	// literal "(unlabeled)", which the charset check then rejected, and no
+	// other string could reach it. Both "" and the literal address it now.
+	if merchant == unlabeled {
+		merchant = ""
+	}
 	name, ok := cleanMerchant(merchant)
-	if !ok || merchant == "" {
+	if !ok {
 		return MerchantBalance{}, ErrBadMerchant
 	}
 	if ref == "" || len(ref) > 128 {
