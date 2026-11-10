@@ -37,10 +37,10 @@ fupi-vault pin  --atm https://KIOSK:8890 --pin-tls <fingerprint>   # compare the
 fupi-vault device                                                    # send the public key to the operator
 
 # operator, per participant (one bank transfer = one unique ref)
-fupi-vault bank 500 --ref <bank UTR>
-fupi-vault allocate <device-pubkey> 500 --ref ALLOC-<name>-1
+fupi-vault bank 500 --ref <bank UTR> --atm https://KIOSK:8890 --pin-tls <fp>
+fupi-vault allocate <device-pubkey> 500 --ref ALLOC-<name>-1 --atm https://KIOSK:8890 --pin-tls <fp>
 # participant
-fupi-vault topup 200
+fupi-vault topup 200 --atm https://KIOSK:8890 --pin-tls <fp>
 ```
 
 Never start the pilot with `-allow-anonymous-issuance`. Reserve is credited only after the money
@@ -49,7 +49,7 @@ is visible in the bank account, with its UTR as the `ref`.
 ## 3. Daily routine (10 minutes)
 
 1. Read the bank balance of the pilot account.
-2. `python3 scripts/pilot_check.py --atm https://KIOSK:8890 --pin-tls <fp> --bank-balance <balance> --max-total 5000 --log pilot_log.jsonl` (with `FUPI_CREDIT_SECRET` set).
+2. From `kiosk-go/`: `FUPI_CREDIT_SECRET=$(cat $F/credit_secret.txt) go run ./pilot --atm https://KIOSK:8890 --pin-tls <fp> --bank-balance <balance> --max-total 5000 --log pilot_log.jsonl` (the Python `scripts/pilot_check.py` is retired to `_legacy_python/`).
 3. Exit 0: file the output. Exit 1: **stop the line** (section 5), do not issue or pay anything until explained.
 4. Merchant: `settle-all --merchant <label>` at the end of each trading day; any `rejected` is investigated the same day.
 5. Operator: `report`; pay merchants from the bank app weekly (or when owed exceeds Rs 500), then `payout <merchant> <amt> --ref <UTR>`. Pay first, record second, same day.
@@ -70,7 +70,7 @@ the settlement log sums to reconcile.
 
 | Symptom | Action |
 |---|---|
-| `pilot_check` FAIL | stop issuing (stop the kiosk), snapshot `state.json`, find the cause from `report` + bank statement before restarting |
+| `go run ./pilot` FAIL | stop issuing (stop the kiosk), snapshot `state.json`, find the cause from `report` + bank statement before restarting |
 | bank balance below reserve | treat as a loss event: stop, reconcile every deposit UTR and payout UTR against the statement |
 | bank balance above reserve | an uncredited deposit: credit it with its UTR, rerun the check |
 | lost phone / vault file | the tokens are gone (bearer cash). Cap exposure by quota; no recovery is promised in the consent form |
@@ -86,14 +86,14 @@ the settlement log sums to reconcile.
 2. Participants and merchants settle everything (`settle-all`, or `settle <token>`).
 3. Operator pays every merchant the owed balance (`payout ... --ref UTR`).
 4. Participants whose tokens are unspent: each settles to a payee label with their own name; operator pays that out from the bank like a merchant.
-5. Run `pilot_check`: `issued_outstanding` and `owed_total` must both be 0. Bank balance must then equal `reserve` (0 plus any unrecorded deposits). Return the remainder to yourself.
+5. Run `go run ./pilot`: `issued_outstanding` and `owed_total` must both be 0. Bank balance must then equal `reserve` (0 plus any unrecorded deposits). Return the remainder to yourself.
 6. Archive `state.json`, `pilot_log.jsonl`, bank statement.
 
 ## 7. Pass / fail
 
 The pilot **passes** only if all hold for 30 consecutive days:
 
-- [ ] `pilot_check` exits 0 every day; the bank balance equals the reserve to the rupee
+- [ ] `go run ./pilot` exits 0 every day; the bank balance equals the reserve to the rupee
 - [ ] zero lost tokens: every token ever issued was settled, or is provably held in a named vault
 - [ ] every failure (rejected settle, pending swap, mismatch) was explained from the logs within one day
 - [ ] no operator action outside the CLI (no hand-edited state files)

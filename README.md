@@ -29,7 +29,7 @@
 15. [Roadmap](#15-roadmap)
 16. [Glossary](#16-glossary)
 17. [Sources (verified live)](#17-sources-verified-live)
-18. [MVP: Working Phases 1 & 2](mvp/README.md) — run it today
+18. [MVP: Working Phases 1 & 2](_legacy_python/mvp/README.md) — archived; see `kiosk-go/` for the live Go replacement
 19. [kiosk-go: Self-Contained HTTPS ATM in Go](kiosk-go/README.md) — production-tier mint
 20. [vault-rust: Lightweight RPi Rust Vault](vault-rust/README.md) — memory-safe offline cash
 21. [Architecture Plan & Execution Flow](docs/ARCHITECTURE_PLAN_FLOW.md) — detailed technical specification
@@ -271,7 +271,7 @@ Everything below is **verified open-source**. No proprietary dependency anywhere
 |---|---|---|
 | Token protocol | Cashu NUTs (00–30) | MIT |
 | Mint server | Cashu CDK `cdk-mintd` (Rust) | MIT / Apache-2.0 |
-| Kiosk (this repo, Go port) | `kiosk-go/` — stdlib-only, cross-lang tested | Apache-2.0 |
+| Kiosk (this repo, Go port) | `kiosk-go/` — stdlib-only, Go↔Rust e2e-tested over TLS | Apache-2.0 |
 | Wallet ref / interop | Nutshell (Python) | MIT |
 | Vault firmware base | ESP-IDF | Apache-2.0 |
 | Vault firmware (Rust alt) | esp-rs | MIT / Apache-2.0 |
@@ -287,8 +287,8 @@ any NUT-compatible wallet (Nutshell/Cashu.me class).
 Language per tier (full argument + benchmarks in [kiosk-go/README.md](kiosk-go/README.md)):
 kiosk = **Go** (goroutine-per-connection, stdlib TLS, single static binary),
 vault core = **Rust** via esp-rs (no GC on the money path, `no_std`, panics
-reboot instead of exploit), protocol tests = **Python** (fast math iteration +
-cross-language interop client). C never touches a money path.
+reboot instead of exploit), protocol tests = **Go + Rust** (`kiosk-go/*_test.go`,
+`vault-rust/tests/`; the retired Python suites live in `_legacy_python/`). C never touches a money path.
 
 ## 8. Ownership & Custody
 

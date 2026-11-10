@@ -106,7 +106,7 @@ fupi-vault> WIPE
 - **P2PK lock enforcement:** the lock is an ed25519 public key inside the blind-signed secret; settlement needs a signature by that key (`--claim-key`). Locks can only be set at issuance (`topup --lock`).
 - **No lost tokens:** `pay` stores the emitted token in the `outbox` in the same atomic save that removes the proofs.
 
-Known limits: flash is plaintext JSON (no encryption / PIN / secure element yet), no seed restore, 1 proof = 1 unit. See `docs/CODE_PLAN.md`.
+Known limits: flash is plaintext JSON (no encryption / PIN / secure element yet), no seed restore. See `docs/CODE_PLAN.md`.
 
 ## W2: denominations and change
 
