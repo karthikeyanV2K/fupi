@@ -33,6 +33,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -858,10 +859,40 @@ func (k *Kiosk) saveState() error {
 	// Keep the last known-good state as .bak (never overwrite it with a corrupt file).
 	if _, err := readState(k.statePath); err == nil {
 		if prev, rerr := os.ReadFile(k.statePath); rerr == nil {
-			_ = os.WriteFile(k.statePath+".bak", prev, 0600)
+			if werr := os.WriteFile(k.statePath+".bak", prev, 0600); werr == nil {
+				syncFile(k.statePath + ".bak")
+			} else {
+				log.Printf("[kiosk] WARNING: could not write .bak backup: %v", werr)
+			}
 		}
 	}
-	return os.Rename(tmpPath, k.statePath)
+	if err := os.Rename(tmpPath, k.statePath); err != nil {
+		return err
+	}
+	// The rename is only durable after a directory sync (ext4/SD-card): without
+	// it, a power cut can revert kiosk_state.json after a client was already
+	// told "settled OK", letting the same proof settle twice. Sync the dir
+	// too — it also makes the .bak creation above durable.
+	syncDir(k.statePath)
+	return nil
+}
+
+// syncFile fsyncs a file's data (best effort; only used for the money state).
+func syncFile(path string) {
+	f, err := os.Open(path)
+	if err == nil {
+		_ = f.Sync()
+		_ = f.Close()
+	}
+}
+
+// syncDir fsyncs the directory entry of path (best effort).
+func syncDir(path string) {
+	d, err := os.Open(filepath.Dir(path))
+	if err == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 }
 
 // parseKey rebuilds an RSA key from (n, d) and proves it is a working pair: (2^d)^e == 2 (mod n).
