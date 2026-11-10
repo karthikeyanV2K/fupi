@@ -4,10 +4,10 @@ Same protocol as `mvp/kiosk.py`, rebuilt in **Go** as a self-contained HTTPS ATM
 
 | Tier | Language | Why |
 |---|---|---|
-| **ATM / Mint (this server)** | **Go** | Native HTTPS/TLS without nginx, goroutine-per-conn concurrency, single static binary deploy, GC memory safety |
+| **ATM / Mint (this server + money-ingest gateway)** | **Go** | Native HTTPS/TLS without nginx, goroutine-per-conn concurrency, single static binary deploy, GC memory safety |
 | **Vault Core (RPi / embedded)** | **Rust** (`vault-rust`) | No GC pauses, atomic flash persistence, const-eval safety, panics = safe reboots |
-| **Hardware Prototype** | **MicroPython** (`pico_w/`) | 4-wire hardware proof on Raspberry Pi Pico W + 0.96" OLED |
-| **Protocol Research / Rails** | **Python** (`mvp/`) | Fastest to verify math; bank rail simulation |
+| **Hardware Prototype** | **MicroPython firmware** (`pico_w/`) | 4-wire hardware proof on Raspberry Pi Pico W + 0.96" OLED (device's own platform, not toolchain code) |
+| **Runtime / tests / rails / pilot** | **Go only** | The retired Python MVP, bank rail, pilot check and test harnesses were ported 1:1 into Go (see `_legacy_python/README.md`) |
 
 ## Capabilities
 
@@ -25,11 +25,24 @@ Same protocol as `mvp/kiosk.py`, rebuilt in **Go** as a self-contained HTTPS ATM
 ```bash
 go build -o kiosk-go .                       # Static binary, zero C dependencies
 go vet ./...                                 # Clean
-go test -race ./...                          # Settle math, TLS, credit auth, ledger, locks, crash recovery
-FUPI_CREDIT_SECRET=xyz ./kiosk-go -port 8895 &
-FUPI_CREDIT_SECRET=xyz python cross_lang_test.py 8895 https   # Python <-> Go HTTPS interop
-python e2e_https_rust_vault_test.py          # Go kiosk <-> Rust vault (build both binaries first)
+go test ./...                                # MVP math port, settle math, TLS, credit auth,
+                                             # ledger, locks, crash recovery, CSV/webhook rails,
+                                             # + full Go<->Rust HTTPS e2e (12 steps, needs vault binary)
+# daily pilot check (native, replaces scripts/pilot_check.py):
+FUPI_CREDIT_SECRET=... go run ./pilot --atm https://127.0.0.1:8890 --pin-tls <sha256> \
+    --bank-balance 4820.00 --max-total 5000 --log pilot_log.jsonl
 ```
+
+## Money ingest — the kiosk IS the gateway (no Python anywhere)
+
+| Rail | How money arrives | Command / endpoint | Replay-safety |
+|---|---|---|---|
+| **Bank statement CSV** | download the SBI/HDFC/any CSV export | `./kiosk-go -import-csv ~/fupi-run/sbi_statement.csv -match FUPI` (one-shot, then exit) | ref = `csv:sha256(<row>)` → re-importing the same file can never double-credit |
+| **Gateway webhook** | point Razorpay/Cashfree/Stripe/bank API callback at the kiosk | `POST /v1/webhook` body `{"amount": <MINOR units (paise/cents)>, "order_id"/"ref": "<unique>"}` + header `X-Razorpay-Signature` or `X-Fupi-Signature` = hex(HMAC-SHA256(credit secret, raw body)) | same order id retried by the gateway → HTTP 409, credited once |
+| **Lightning (cdk-mintd)** | offer the kiosk an invoice | `./kiosk-go -lightning-mint http://127.0.0.1:3338 -lightning-amount 1000 -lightning-unit sat` (one-shot poll → PAID ⇒ credit) | ref = `ln:<quote id>` |
+
+All rails funnel into the same append-only `/v1/credit` deposit ledger with
+HMAC + unique external reference. Reserve can only grow through it.
 
 ## HTTP / HTTPS API (`/v1/*`)
 
@@ -71,7 +84,7 @@ export FUPI_CREDIT_SECRET="$(openssl rand -hex 32)"
 
 ## Known limits (tracked in docs/CODE_PLAN.md)
 
-- Every proof is worth exactly 1 unit; denominations are planned (W2).
+- Every proof carries a face value derived from its own keyset (`go-mvp-dN`); the 1-unit legacy keyset (`go-mvp-00`) is kept for compatibility.
 - The signing key is stored in the state file (mode 0600) in plaintext; use disk encryption / an HSM before real money.
 - State is rewritten in full on every sign/settle (O(n)); fine for pilots, not for scale.
 - The reserve is a number in a file. Real money needs the bank-side reconciliation described in docs/CODE_PLAN.md.

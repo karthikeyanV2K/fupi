@@ -1256,6 +1256,8 @@ func SetupMux(k *Kiosk, tlsEnabled bool, fingerprint string) *http.ServeMux {
 		}
 	})
 
+	k.registerWebhook(mux)
+
 	// POST /v1/allocate  (operator, HMAC-authenticated like /v1/credit)
 	// body {"device":"<ed25519 pubkey hex>","amount":N,"ref":"<unique>"}
 	mux.HandleFunc("/v1/allocate", func(w http.ResponseWriter, r *http.Request) {
@@ -1454,7 +1456,45 @@ func main() {
 		"HMAC secret authenticating POST /v1/credit (prefer env FUPI_CREDIT_SECRET). Empty = credit endpoint disabled")
 	anon := flag.Bool("allow-anonymous-issuance", false,
 		"DEV ONLY: accept /v1/blind-sign without a device signature (no per-device quota)")
+	csvFile := flag.String("import-csv", "",
+		"ONE-SHOT: import a bank statement CSV (with -match to filter by narration), credit the reserve, then exit")
+	match := flag.String("match", "",
+		"csv import: only deposit rows whose narration contains this text (e.g. FUPI)")
+	lightningMint := flag.String("lightning-mint", "",
+		"ONE-SHOT: create + poll a cdk-mintd Lightning quote for -lightning-amount units, credit the reserve, then exit")
+	lightningAmount := flag.Int("lightning-amount", 1000,
+		"lightning quote amount in MINOR units (sats by default)")
+	lightningUnit := flag.String("lightning-unit", "sat", "lightning quote unit (sat/usd/eur)")
 	flag.Parse()
+
+	// ONE-SHOT RAILS (native, no Python): run with the same state file.
+	if *csvFile != "" || *lightningMint != "" {
+		k, err := NewKiosk(*statePath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		k.SetCreditSecret(*creditSecret)
+		defer func() {}() // nothing to clean up; the process exits below
+		did := false
+		if *csvFile != "" {
+			total, _, err := k.runCsvImport(*csvFile, *match)
+			if err != nil {
+				log.Fatalf("csv import failed: %v", err)
+			}
+			log.Printf("[kiosk] reserve now %.2f (+%.2f from %s)", k.reserve, total, *csvFile)
+			did = true
+		}
+		if *lightningMint != "" {
+			if _, err := k.runLightningPoll(*lightningMint, *lightningAmount, *lightningUnit, 600*time.Second, 2*time.Second); err != nil {
+				log.Fatalf("lightning poll failed: %v", err)
+			}
+			did = true
+		}
+		if !did {
+			log.Fatal("nothing to do")
+		}
+		return
+	}
 
 	k, err := NewKiosk(*statePath)
 	if err != nil {
