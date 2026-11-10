@@ -80,10 +80,13 @@ func (b webhookBody) ref() string {
 // ---------------------------------------------------------------------------
 
 // CsvBank imports REAL bank statement CSV exports (HDFC/ICICI/SBI/Chase style).
-// Only DEPOSIT (credit) rows count. Every credited row gets a reference = hash
-// of the whole row, so re-importing the same or overlapping statement cannot
-// credit twice. Rows are skipped when narration_match is set and the narration
-// does not contain it (use it so salary etc. are never treated as kiosk loads).
+// Only DEPOSIT (credit) rows count. Every credited row gets an idempotency
+// reference: the FUPI remark token from the narration when present
+// ("utr:<TOKEN>"), else a hash of the stable columns (date + narration +
+// amount) — see depositRefFor. Re-importing the same or an overlapping
+// statement therefore cannot credit twice. Rows are skipped when
+// narration_match is set and the narration does not contain it (use it so
+// salary etc. are never treated as kiosk loads).
 func (k *Kiosk) runCsvImport(path, narrationMatch string) (credited float64, okRows int, err error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -109,6 +112,10 @@ func (k *Kiosk) runCsvImport(path, narrationMatch string) (credited float64, okR
 	if depositCol == -1 {
 		amountCol = pickCol(header, "amount")
 	}
+	if depositCol == -1 && amountCol == -1 {
+		return 0, 0, fmt.Errorf("no deposit/credit/amount column recognized in header %q — refusing to import", strings.Join(header, ", "))
+	}
+	dateCol := pickCol(header, "date", "txn date", "value date", "transaction date")
 	descCol := pickCol(header, "narration", "description", "particulars", "remarks", "detail")
 	match := strings.ToLower(narrationMatch)
 
@@ -133,7 +140,7 @@ func (k *Kiosk) runCsvImport(path, narrationMatch string) (credited float64, okR
 		if match != "" && !strings.Contains(desc, match) {
 			continue // not addressed to the kiosk
 		}
-		ref := csvRowRef(row)
+		ref := depositRefFor(cell(row, dateCol), desc, amount)
 		if _, dup := k.depositRefs[ref]; dup {
 			log.Printf("[rail:csv] SKIP already-credited row (%s)", desc)
 			continue
@@ -244,14 +251,38 @@ func parseMoneyAmount(v string) float64 {
 	return 0
 }
 
-// csvRowRef builds the idempotency reference: the hashes whole canonical row.
-func csvRowRef(row []string) string {
-	pairs := make([]string, 0, len(row))
-	for i, v := range row {
-		pairs = append(pairs, fmt.Sprintf("%d=%s", i, strings.TrimSpace(v)))
+// depositRefFor builds the idempotency reference for one statement row.
+//
+// PREFERRED — identity: the FUPI remark token in the narration
+// ("FUPI-<UTR/token>", case-insensitive, normalized to upper case). The same
+// real deposit then maps to ONE ref across re-exports, column-layout changes
+// and formatting drift, and a manual credit that quotes the same token lands
+// on the same ref, so the same real money can never be credited twice (the
+// bank's own receipt number is the dedupe key).
+//
+// FALLBACK — stable-column hash: date + narration + deposit amount only,
+// NEVER the balance column, so cosmetic re-exports don't remint refs. Two
+// genuinely distinct same-day same-amount rows without a token stay deduped
+// (safe direction: an under-credit beats an over-credit; include the UTR in
+// the remark to get both paid).
+func depositRefFor(date, desc string, amount float64) string {
+	if tok, ok := fupiRemarkToken(desc); ok {
+		return "utr:" + tok
 	}
-	sum := sha256.Sum256([]byte(strings.Join(pairs, "|")))
+	canonical := strings.Join([]string{strings.TrimSpace(date), strings.TrimSpace(desc), fmt.Sprintf("%.2f", amount)}, "|")
+	sum := sha256.Sum256([]byte(canonical))
 	return "csv:" + hex.EncodeToString(sum[:16])
+}
+
+var fupiTokenRe = regexp.MustCompile(`(?i)FUPI\s*[-_/:. ]\s*([A-Za-z0-9._-]{3,64})`)
+
+// fupiRemarkToken extracts the FUPI-<token> reference from a narration, if any.
+func fupiRemarkToken(desc string) (string, bool) {
+	m := fupiTokenRe.FindStringSubmatch(desc)
+	if m == nil {
+		return "", false
+	}
+	return strings.ToUpper(m[1]), true
 }
 
 // ---------------------------------------------------------------------------
