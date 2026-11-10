@@ -38,7 +38,7 @@ FLASH=shop.json  v pin                                    # a second vault actin
 |---|---|---|---|
 | 1 | Transfer Rs 200 SRC -> PILOT | PILOT balance 200 | bank statement line, UTR `D1` |
 | 2 | `v bank 200 --ref D1` | reserve 200 | kiosk output |
-| 3 | `python3 scripts/pilot_check.py --atm $ATM --pin-tls $PIN --bank-balance 200 --log dryrun_log.jsonl` | PASS, "bank balance matches reserve" | check output |
+| 3 | `cd kiosk-go && FUPI_CREDIT_SECRET=$(cat $F/credit_secret.txt) go run ./pilot --atm $ATM --pin-tls $PIN --bank-balance 200 --max-total 500 --log dryrun_log.jsonl` | PASS, "bank balance matches reserve" | check output |
 | 4 | `FLASH=alice.json v allocate <alice-pubkey> 200 --ref A1` | quota 200 | output |
 | 5 | **Negative:** `FLASH=alice.json v topup 300` | REFUSED (quota/reserve) | error text. You cannot issue more than was paid in. |
 | 6 | `FLASH=alice.json v topup 200` | balance 200 | output |
