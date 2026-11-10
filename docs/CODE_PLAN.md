@@ -53,14 +53,14 @@ The bank holds the money. The vault holds *claims* on it. The kiosk's job is to 
 | 7 | Corrupt Go state silently created a new key; no `.bak` | `.bak` + refuse to start on unreadable state; signature released only after state is persisted | `TestCorruptStateNeverRegeneratesKey` |
 | 8 | No server timeouts / body limits; secrets logged in debug | timeouts, 64 KB body cap, debug logging removed | (build + e2e) |
 | 9 | `blind-sign amount=N` counted N units but signed one proof | amount must be a supported denomination; face value comes from the keyset | `TestBlindSignRejectsUnsupportedDenominations` |
-| 10 | `bank_rail.py`: default secret, no webhook replay guard, withdrawals counted as top-ups, re-importing a CSV doubled the reserve | no default secret, `ref`-based dedupe, deposits only, `--match` narration filter | `bank_rail.py --mode selftest` |
+| 10 | `bank_rail.py` (retired): default secret, no webhook replay guard, withdrawals counted as top-ups, re-importing a CSV doubled the reserve | no default secret, `ref`-based dedupe, deposits only, `--match` narration filter; identity refs (`utr:<token>`) in `rails.go` | `go test -run 'TestCsv|TestWebhook'` (`rails_test.go`) |
 
 ### W1: deposit-authorised issuance
 
 * `POST /v1/credit {amount, ref}`: signed, `ref` unique (bank UTR, gateway order id, LN quote id).
 * Append-only ledger in the state file; `GET /v1/reconcile` returns reserve, outstanding tokens,
   deposit total/count, settled count, `fully_backed`, `ledger_consistent`.
-* `bank_rail.py` passes a `ref` for every rail and refuses replays on its own side as well.
+* `bank_rail.py` (retired to `_legacy_python/`; Go replacement `kiosk-go/rails.go` + `webhook.go`) passes a `ref` for every rail and refuses replays on its own side as well.
 * Old state files get a `legacy-opening-balance` ledger entry so reconcile stays consistent.
 
 ## 3. Next: W2 to W5 in code terms
@@ -69,10 +69,10 @@ The bank holds the money. The vault holds *claims* on it. The kiosk's job is to 
 
 | Piece | Design | Test |
 |---|---|---|
-| Keysets | one RSA key per denomination; ids `go-mvp-00` (1, legacy) and `go-mvp-d<N>`; `GET /v1/keysets` | `TestKeysetMapping`, cross_lang [8][9] |
-| Face value | derived from the keyset the signature verifies under, never from a client field; `issued` is money | `TestDenominatedIssueAndSettle` |
+| Keysets | one RSA key per denomination; ids `go-mvp-00` (1, legacy) and `go-mvp-d<N>`; `GET /v1/keysets` | `TestKeysetIDMappingAndDenominations` |
+| Face value | derived from the keyset the signature verifies under, never from a client field; `issued` is money | `TestDenominatedIssueAndSettleMoveMoney` |
 | Device identity | vault holds an ed25519 key; operator allocates quota (`POST /v1/allocate`, HMAC + unique ref, total <= reserve); each request signed over `device|seq|amount|blinded`, seq strictly increasing | `TestDevice*`, e2e step 4 |
-| Anonymous issuance | off unless `-allow-anonymous-issuance` (dev only) | `TestHTTPBlindSignNeedsDevice` |
+| Anonymous issuance | off unless `-allow-anonymous-issuance` (dev only) | `TestHTTPBlindSignNeedsDeviceUnlessAnonymous` |
 | Change-making | `POST /v1/swap`: unlocked proofs in, same-total blind outputs out; idempotent (same request returns the same signatures) | `TestSwap*`, e2e step 4b |
 | Vault | balance in money; exact-subset payment (`NeedChange` if coins do not add up); `pay` swaps automatically; write-ahead `pending_swap` + `recover`/`recover --abandon` | `tests/w2_tests.rs` |
 
@@ -114,10 +114,11 @@ Automation (bank payout API) stays out until a licensed entity is in the loop.
 
 * `docs/PILOT_RUNBOOK.md`: parameters, roles, day-0 setup, daily routine, incidents, wind-down, pass/fail.
 * `docs/PILOT_CONSENT.md`: participant consent template (have it reviewed).
-* `scripts/pilot_check.py`: daily check (exit 1 = stop issuing). Verifies fully-backed / ledger invariants,
+* `kiosk-go/pilot` (`go run ./pilot`): daily check (exit 1 = stop issuing). Verifies fully-backed / ledger invariants,
   **bank balance vs reserve**, pilot cap, day-over-day monotonic totals (state rollback or tampering), every
   reserve change explained by a deposit or payout, and the settlement log summing to reconcile. Appends an
-  audit line to `pilot_log.jsonl`. Tests: `scripts/test_pilot_check.py`, e2e step 12.
+  audit line to `pilot_log.jsonl`. Tests: e2e step 12 (`TestE2EHttpsRustVaultHardened`); the Python
+  `scripts/test_pilot_check.py` is retired to `_legacy_python/`.
 * Success criteria: reconcile matches to the rupee for 30 days; zero lost tokens; every failure recoverable
   from the outbox/journal.
 
@@ -140,10 +141,12 @@ Automation (bank payout API) stays out until a licensed entity is in the loop.
 ## 5. How to run everything
 
 ```bash
-(cd kiosk-go   && go vet ./... && go test -race ./... && go build -o kiosk-go .)
+(cd kiosk-go   && go vet ./... && go test ./... && go build -o kiosk-go .)   # no -race: unsupported on this Pi (39-bit VMA)
 (cd vault-rust && cargo test && cargo build)
-python3 mvp/test_mvp.py
-python3 mvp/bank_rail.py --mode selftest
-python3 scripts/test_pilot_check.py
-python3 kiosk-go/e2e_https_rust_vault_test.py
+# MVP checks + rails:
+(cd kiosk-go   && go test -run 'TestMvp|TestCsv|TestWebhook' -v .)
+# 12-step live e2e (needs the built vault binary; binds a port):
+(cd kiosk-go   && go test -run TestE2EHttpsRustVaultHardened -v .)
+# Daily bank check:
+(cd kiosk-go   && FUPI_CREDIT_SECRET=$(cat $F/credit_secret.txt) go run ./pilot --atm https://127.0.0.1:8890 --pin-tls <fp> --bank-balance <balance> --log pilot_log.jsonl)
 ```

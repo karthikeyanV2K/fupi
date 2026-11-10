@@ -177,7 +177,7 @@
 ### Raspberry Pi (RPi 3, 4, 5 & Linux SBCs)
 - **Runtime:** Native Rust binary (`fupi-vault`), zero runtime dependencies.
 - **Storage:** Power-loss resilient atomic flash journaling (`.tmp` write &rarr; `file.sync_all()` &rarr; `.bak` snapshot &rarr; rename to `vault_flash.json`). Automatically recovers from incomplete writes or truncated 0-byte states without losing money.
-- **Interface:** CLI subcommands (`topup`, `pay`, `receive`, `verify`, `settle`, `balance`, `bank`, `info`, `status`, `wipe`) + interactive terminal REPL for SSH or local serial console.
+- **Interface:** CLI subcommands (`pin`, `device`, `bank`, `allocate`, `topup`, `balance`, `pay`, `accept`, `receive`, `verify`, `receipts`, `settle`, `settle-all`, `report`, `payout`, `swap`, `recover`, `outbox`, `ack`, `keygen`, `status`, `wipe`, `repl`) — see `vault-rust/README.md`.
 - **Network:** Pure Rust TLS (`rustls`) client with support for self-signed development certificates (`--insecure`) and custom CA roots.
 
 ### Raspberry Pi Pico W (RP2040 MicroPython)
@@ -201,9 +201,9 @@
 | **Go ATM hardening tests** | `kiosk-go/hardening_test.go` | HMAC-authenticated credit, replayed bank ref, reconcile ledger, locked-proof claims (no key / wrong key / relabel / stripped lock), corrupt-state recovery without key regeneration, legacy opening balance | **PASS** |
 | **Go ATM Unit & Concurrency Tests** | `kiosk-go/settle_test.go` | In-process blinding math, signature verification, settlement, double-spend replay prevention, invalid Base64 input resilience, and 50-goroutine parallel race serialization | **PASS** |
 | **Go ATM TLS Tests** | `kiosk-go/tls_test.go` | Self-signed TLS cert generation, HTTPS listener boot, custom CA client verification, HTTPS endpoints | **PASS** |
-| **Rust Vault Unit Tests** | `vault-rust/src/{crypto,client,storage}.rs` | Base64, hashing, modular inverse, blind/unblind/verify, lock + claim signature, TLS pin matching, atomic storage | **PASS** (11/11) |
+| **Rust Vault Unit Tests** | `vault-rust/src/{crypto,client,storage}.rs` | Base64, hashing, modular inverse, blind/unblind/verify, lock + claim signature, TLS pin matching, atomic storage | **PASS** (15/15) |
 | **Rust Flash Resilience Tests** | `vault-rust/src/storage.rs` | Atomic file write, sync_all, rename, persistence reload, wipe, and power-loss recovery from corrupted/truncated primary files via `.bak` | **PASS** (2/2) |
 | **Rust Vault Tests** | `vault-rust/tests/vault_tests.rs` | Lifecycle with real locks, tamper rejection, P2P receive, counterfeit modulus, `e=1` forgery, no-pinned-keyset refusal, keyset-pin change refusal, lock-aware proof selection, outbox crash safety | **PASS** (8/8) |
-| **Python <-> Go TLS Interop** | `kiosk-go/cross_lang_test.py` | Python blinding & unblinding &rarr; Go HTTPS ATM signing & settle over TLS with certificate reuse | **PASS** |
-| **End-to-End System Test** | `kiosk-go/e2e_https_rust_vault_test.py` | Pinned-TLS boot, strict/wrong-pin refusal, authenticated + idempotent credit, blind topup, real P2PK (no key / wrong key / relabelled / owner), outbox, P2P receive, forged `e=1`/fake-modulus rejection, 5-way settle race, final reconcile | **PASS** (9 steps) |
-| **MVP Reference Test** | `mvp/test_mvp.py` | 17 reference bank rail and Chaum blinding tests | **PASS** (17/17) |
+| **Python <-> Go TLS Interop** | `_legacy_python/kiosk-go/cross_lang_test.py` | **RETIRED** — Python blinding & unblinding &rarr; Go HTTPS ATM signing & settle over TLS with certificate reuse | superseded by `TestE2EHttpsRustVaultHardened` |
+| **End-to-End System Test** | `kiosk-go/e2e_vault_test.go` | Pinned-TLS boot, strict/wrong-pin refusal, authenticated + idempotent credit, blind topup, real P2PK (no key / wrong key / relabelled / owner), outbox, P2P receive, forged `e=1`/fake-modulus rejection, 5-way settle race, final reconcile | **PASS** (12 steps) |
+| **MVP Reference Test** | `kiosk-go/mvp_suite_test.go` (`TestMvp*`) | the historic 17 reference bank-rail and Chaum blinding checks, ported to Go | **PASS** |

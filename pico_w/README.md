@@ -40,8 +40,8 @@ The easiest tool is **Thonny IDE** (free at [thonny.org](https://thonny.org/)):
 1. Open **Thonny**.
 2. In the bottom right corner, click the interpreter and choose:
    **`MicroPython (Raspberry Pi Pico)`**.
-3. Open [`X:\fupi\pico_w\ssd1306.py`](file:///X:/fupi/pico_w/ssd1306.py) in Thonny &rarr; Click **File** &rarr; **Save as...** &rarr; select **Raspberry Pi Pico** &rarr; name it `ssd1306.py`.
-4. Open [`X:\fupi\pico_w\main.py`](file:///X:/fupi/pico_w/main.py) in Thonny &rarr; Click **File** &rarr; **Save as...** &rarr; select **Raspberry Pi Pico** &rarr; name it `main.py`.
+3. Open [`pico_w/ssd1306.py`](../pico_w/ssd1306.py) in Thonny &rarr; Click **File** &rarr; **Save as...** &rarr; select **Raspberry Pi Pico** &rarr; name it `ssd1306.py`.
+4. Open [`pico_w/main.py`](../pico_w/main.py) in Thonny &rarr; Click **File** &rarr; **Save as...** &rarr; select **Raspberry Pi Pico** &rarr; name it `main.py`.
 5. Press **F5** (or click the green Play icon) to run!
 
 ---
@@ -49,9 +49,9 @@ The easiest tool is **Thonny IDE** (free at [thonny.org](https://thonny.org/)):
 ## 4. Testing Bank Transfers and Top-Ups
 
 1. Make sure your Kiosk is running on your PC:
-   ```powershell
-   cd X:\fupi\kiosk-go
-   .\kiosk-go.exe -port 8890
+   ```bash
+   cd /path/to/fupi/kiosk-go
+   ./kiosk-go -port 8890
    ```
 2. On Thonny's Shell / Serial console, you will see:
    ```text

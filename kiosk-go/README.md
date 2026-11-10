@@ -1,6 +1,6 @@
 # kiosk-go — the FUPI Self-Contained Go HTTPS ATM & Mint
 
-Same protocol as `mvp/kiosk.py`, rebuilt in **Go** as a self-contained HTTPS ATM and blind-signature cash mint.
+Same protocol as `_legacy_python/mvp/kiosk.py`, rebuilt in **Go** as a self-contained HTTPS ATM and blind-signature cash mint.
 
 | Tier | Language | Why |
 |---|---|---|
@@ -37,7 +37,7 @@ FUPI_CREDIT_SECRET=... go run ./pilot --atm https://127.0.0.1:8890 --pin-tls <sh
 
 | Rail | How money arrives | Command / endpoint | Replay-safety |
 |---|---|---|---|
-| **Bank statement CSV** | download the SBI/HDFC/any CSV export | `./kiosk-go -import-csv ~/fupi-run/sbi_statement.csv -match FUPI` (one-shot, then exit) | ref = `csv:sha256(<row>)` → re-importing the same file can never double-credit |
+| **Bank statement CSV** | download the SBI/HDFC/any CSV export | `FUPI_CREDIT_SECRET=$(cat ~/fupi-run/credit_secret.txt) ./kiosk-go -import-csv ~/fupi-run/sbi_statement.csv -match FUPI` (one-shot, then exit) | ref = `utr:<FUPI-token>` when the narration carries `FUPI-<token>` (case-insensitive), else `csv:sha256(date|narration|amount)` — re-imports and cosmetic re-exports can never double-credit |
 | **Gateway webhook** | point Razorpay/Cashfree/Stripe/bank API callback at the kiosk | `POST /v1/webhook` body `{"amount": <MINOR units (paise/cents)>, "order_id"/"ref": "<unique>"}` + header `X-Razorpay-Signature` or `X-Fupi-Signature` = hex(HMAC-SHA256(credit secret, raw body)) | same order id retried by the gateway → HTTP 409, credited once |
 | **Lightning (cdk-mintd)** | offer the kiosk an invoice | `./kiosk-go -lightning-mint http://127.0.0.1:3338 -lightning-amount 1000 -lightning-unit sat` (one-shot poll → PAID ⇒ credit) | ref = `ln:<quote id>` |
 
@@ -56,7 +56,8 @@ POST /v1/credit           <- {"amount": 100, "ref": "<unique bank reference>"}
                              header X-Fupi-Signature: hex(HMAC-SHA256(credit secret, raw body))
                           -> 200 {"reserve":..} | 401 bad signature | 409 duplicate ref
                              | 400 bad ref/amount | 503 no credit secret configured
-POST /v1/blind-sign       <- {"blinded_message":"<b64url>","amount":1}     # amount must be 1 (one proof = one unit)
+POST /v1/blind-sign       <- {"blinded_message":"<b64url>","amount":5}     # amount must be a supported
+                          # denomination (1/2/5/10/20/100/500); face value comes from the keyset
                           -> {"blind_signature":"<b64url>"} (402 if reserve exceeded)
 POST /v1/settle           <- {"secret":"...","sig":"<b64url>","n":"...","e":65537,
                               "claimer":"<hex ed25519 signature over secret, locked proofs only>"}
@@ -80,6 +81,14 @@ export FUPI_CREDIT_SECRET="$(openssl rand -hex 32)"
 
 # Run with custom TLS certificate
 ./kiosk-go -port 8890 -tls=true -cert mycert.pem -key mykey.pem
+
+# Certificate lifecycle (all flags):
+#   -save-cert (default true)  writes kiosk_cert.pem / kiosk_key.pem into the
+#                              PROCESS CWD — always start the kiosk from the
+#                              same directory, or every pin (--pin-tls) breaks
+#   -force-new-cert            deliberate rotation: mints a new keypair;
+#                              every wallet must re-pin afterwards (pin --force)
+#   -credit-secret             same as FUPI_CREDIT_SECRET (prefer the env var)
 ```
 
 ## Known limits (tracked in docs/CODE_PLAN.md)
