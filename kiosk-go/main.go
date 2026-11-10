@@ -1474,6 +1474,12 @@ func main() {
 			log.Fatal(err)
 		}
 		k.SetCreditSecret(*creditSecret)
+		// Money rails move the reserve: they must never run unauthenticated,
+		// even as one-shot operator commands (defense in depth vs stray local
+		// processes/cronjobs that share this state file by accident).
+		if !k.CreditEnabled() {
+			log.Fatal("one-shot money rails (-import-csv / -lightning-mint) require -credit-secret or FUPI_CREDIT_SECRET")
+		}
 		defer func() {}() // nothing to clean up; the process exits below
 		did := false
 		if *csvFile != "" {
